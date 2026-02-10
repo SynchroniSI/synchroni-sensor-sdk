@@ -1,0 +1,6 @@
+/build/
+/.conda/
+/dist/
+/sensor_sdk.egg-info/
+/synchroni_sensor_sdk.egg-info/
+/.vscode/

@@ -1,204 +1,212 @@
 # synchroni-sensor-sdk
 
-Synchroni sdk for Python
+Python SDK for interfacing with Synchroni BLE sensor devices.
 
-## Brief
+## Requirements
 
-Synchroni SDK is the software development kit for developers to access Synchroni products.
-
-## Contributing
-
-See the [contributing guide](CONTRIBUTING.md) to learn how to contribute to the repository and the development workflow.
-
-## License
-
-MIT
-
----
+- Python 3.10+
+- Bluetooth enabled on the host machine
 
 ## Installation
 
 ```sh
-pip install synchroni-sensor-sdk 
+pip install synchroni-sensor-sdk
+
+# Or install with poetry
+poetry add synchroni-sensor-sdk
 ```
 
-## 1. Permission
+To install from source for development:
 
-Application will obtain bluetooth permission by itself.
+```sh
+git clone https://github.com/SynchroniSI/synchroni-sensor-sdk.git
+cd synchroni-sensor-sdk
+pip install .
+```
 
-## 2. Import SDK
+Or with [Poetry](https://python-poetry.org/):
+
+```sh
+poetry install
+```
+
+## Quick start
+
+The SDK requests Bluetooth permissions automatically on supported platforms.
 
 ```python
 from sensor import *
 ```
 
+`SensorController` is a singleton. A pre-created instance is available as `SensorControllerInstance`:
+
+```python
+controller = SensorControllerInstance  # equivalent to SensorController()
+```
+
+See the [examples](examples/) directory for full working scripts:
+
+- `console.py` — synchronous scan, connect, and stream
+- `async_console.py` — async equivalents
+- `SynchroniSDKPython_Demo.py` / `SynchroniSDKPython_DemoEMG.py` — GUI demos
+
+For a class-by-class overview of the API (including sync vs async methods), see the [API reference](docs/API.md).
+
 ## SensorController methods
 
-### 1. Initalize
+### Initialize
 
 ```python
-SensorControllerInstance = SensorController()
+controller = SensorController()
 
 # register scan listener
-if not SensorControllerInstance.hasDeviceFoundCallback:
-    def on_device_callback(deviceList: List[BLEDevice]):
-        # return all devices doesn't connected
+if not controller.hasDeviceFoundCallback:
+    def on_device_callback(device_list: list[BLEDevice]):
+        # called periodically with discovered devices
         pass
-    SensorControllerInstance.onDeviceFoundCallback = on_device_callback
+
+    controller.onDeviceFoundCallback = on_device_callback
 ```
 
-### 2. Start scan
+### Start scan
 
-Use `def startScan(period_in_ms: int) -> bool` to start scan
+Use `startScan(period_in_ms: int) -> bool` to start continuous scanning:
 
 ```python
-success = SensorControllerInstance.startScan(6000)
+success = controller.startScan(6000)
 ```
 
-returns true if start scan success, periodInMS means onDeviceCallback will be called every periodInMS
+Returns `True` if scanning started. `period_in_ms` controls how often `onDeviceFoundCallback` is invoked.
 
-Use `def scan(period_in_ms: int) -> list[BLEDevice]` to scan once time
+Use `scan(period_in_ms: int) -> list[BLEDevice]` for a one-shot scan:
 
 ```python
-bleDevices = SensorControllerInstance.scan(6000)
+ble_devices = controller.scan(6000)
 ```
 
-### 3. Stop scan
-
-Use `def stopScan() -> None` to stop scan
+### Stop scan
 
 ```python
-SensorControllerInstance.stopScan()
+controller.stopScan()
 ```
 
-### 4. Check scaning
-
-Use `property isScanning: bool` to check scanning status
+### Check scanning status
 
 ```python
-isScanning = SensorControllerInstance.isScanning
+is_scanning = controller.isScanning
 ```
 
-### 5. Check if bluetooth is enabled
-
-Use `property isEnable: bool` to check if bluetooth is enable
+### Check if Bluetooth is enabled
 
 ```python
-isEnable = SensorControllerInstance.isEnable
+is_enabled = controller.isEnable
 ```
 
-### 6. Create SensorProfile
-
-Use `def requireSensor(device: BLEDevice) -> SensorProfile | None` to create SensorProfile.
-
-If bleDevice is invalid, result is None.
+Register a callback for Bluetooth enable/disable changes:
 
 ```python
-sensorProfile = SensorControllerInstance.requireSensor(bleDevice)
+controller.onEnableCallback = lambda enabled: print(f"Bluetooth enabled: {enabled}")
 ```
 
-### 7. Get SensorProfile
+### Create SensorProfile
 
-Use `def getSensor(device: BLEDevice) -> SensorProfile | None` to get SensorProfile.
-
-If SensorProfile didn't created, result is None.
+Use `requireSensor(device: BLEDevice) -> SensorProfile | None` to get or create a `SensorProfile` for a device:
 
 ```python
-sensorProfile = SensorControllerInstance.getSensor(bleDevice)
+sensor_profile = controller.requireSensor(ble_device)
 ```
 
-### 8. Get Connected SensorProfiles
+### Get SensorProfile
 
-Use `def getConnectedSensors() -> list[SensorProfile]` to get connected SensorProfiles.
+Use `getSensor(device_mac: str) -> SensorProfile | None` to look up an existing profile by MAC address:
 
 ```python
-sensorProfiles = SensorControllerInstance.getConnectedSensors()
+sensor_profile = controller.getSensor(ble_device.Address)
 ```
 
-### 9. Get Connected BLE Devices
+Returns `None` if no profile exists for that address.
 
-Use `def getConnectedDevices() -> list[BLEDevice]` to get connected BLE Devices.
+### Get connected SensorProfiles
 
 ```python
-bleDevices = SensorControllerInstance.getConnectedDevices()
+sensor_profiles = controller.getConnectedSensors()
 ```
 
-### 10. Terminate
-
-Use `def terminate()` to terminate sdk
+### Get connected BLE devices
 
 ```python
+ble_devices = controller.getConnectedDevices()
+```
 
-def terminate():
-    SensorControllerInstance.terminate()
+### Terminate
+
+Call `terminate()` when your application exits (including on Ctrl+C) to disconnect sensors and release resources:
+
+```python
+import signal
+import time
+
+def shutdown():
+    controller.terminate()
     exit()
-    
+
 def main():
-    signal.signal(signal.SIGINT, lambda signal, frame: terminate())
-    time.sleep(30)
-    SensorControllerInstance.terminate()
-    
-Please MAKE SURE to call terminate when exit main() or press Ctrl+C
+    signal.signal(signal.SIGINT, lambda sig, frame: shutdown())
+    # ... your application logic ...
+    controller.terminate()
+
+if __name__ == "__main__":
+    main()
 ```
 
 ## SensorProfile methods
 
-### 11. Initalize
+### Initialize callbacks
 
-Please register callbacks for SensorProfile
+Register callbacks before connecting:
 
 ```python
-sensorProfile = SensorControllerInstance.requireSensor(bleDevice)
+sensor_profile = controller.requireSensor(ble_device)
 
-# register callbacks
-def on_state_changed(sensor, newState):
-    # please do logic when device disconnected unexpected
+def on_state_changed(sensor, new_state):
+    # handle unexpected disconnects
     pass
 
 def on_error_callback(sensor, reason):
-    # called when error occurs
     pass
 
 def on_power_changed(sensor, power):
-    # callback for get battery level of device, power from 0 - 100, -1 is invalid
+    # power ranges from 0–100; -1 is invalid
     pass
 
 def on_data_callback(sensor, data):
-    # called after start data transfer
     pass
 
-sensorProfile.onStateChanged = on_state_changed
-sensorProfile.onErrorCallback = on_error_callback
-sensorProfile.onPowerChanged = on_power_changed
-sensorProfile.onDataCallback = on_data_callback
+sensor_profile.onStateChanged = on_state_changed
+sensor_profile.onErrorCallback = on_error_callback
+sensor_profile.onPowerChanged = on_power_changed
+sensor_profile.onDataCallback = on_data_callback
 ```
 
-### 12. Connect device
-
-Use `def connect() -> bool` to connect.
+### Connect
 
 ```python
-success = sensorProfile.connect()
+success = sensor_profile.connect()
 ```
 
-### 13. Disconnect
-
-Use `def disconnect() -> bool` to disconnect.
+### Disconnect
 
 ```python
-success = sensorProfile.disconnect()
+success = sensor_profile.disconnect()
 ```
 
-### 14. Get device status
+### Device state
 
-Use `property deviceState: DeviceStateEx` to get device status.
-
-Please send command in 'Ready' state, should be after connect() return True.
+Use `deviceState: DeviceStateEx` to check connection status. Send commands only when the device is in the `Ready` state (after `connect()` returns `True`):
 
 ```python
-deviceStateEx = sensorProfile.deviceState
+state = sensor_profile.deviceState
 
-# deviceStateEx has define:
 # class DeviceStateEx(Enum):
 #     Disconnected = 0
 #     Connecting = 1
@@ -208,84 +216,79 @@ deviceStateEx = sensorProfile.deviceState
 #     Invalid = 5
 ```
 
-### 15. Get BLE device of SensorProfile
-
-Use `property BLEDevice: BLEDevice` to get BLE device of SensorProfile.
+### BLE device
 
 ```python
-bleDevice = sensorProfile.BLEDevice
+ble_device = sensor_profile.BLEDevice
 ```
 
-### 16. Get device info of SensorProfile
+### Device info
 
-Use `def getDeviceInfo() -> dict | None` to get device info of SensorProfile.
-
-Please call after device in 'Ready' state, return None if it's not connected.
+Use `getDeviceInfo() -> DeviceInfo | None`. Call after the device reaches `Ready` state and `init()` succeeds. Returns `None` if not initialized.
 
 ```python
-    deviceInfo = sensorProfile.getDeviceInfo()
+device_info = sensor_profile.getDeviceInfo()
 
-# deviceInfo has defines:
-# deviceInfo = {
-#     "deviceName": str,
-#     "modelName": str,
-#     "hardwareVersion": str,
-#     "firmwareVersion": str,
-#     "emgChannelCount": int,
-#     "eegChannelCount": int,
-#     "ecgChannelCount": int,
-#     "accChannelCount": int,
-#     "gyroChannelCount": int,
-#     "brthChannelCount": int,
-#     "mtuSize": int
-# }
+# DeviceInfo attributes:
+# device_info.DeviceName
+# device_info.ModelName
+# device_info.HardwareVersion
+# device_info.FirmwareVersion
+# device_info.EmgChannelCount, device_info.EmgSampleRate
+# device_info.EegChannelCount, device_info.EegSampleRate
+# device_info.EcgChannelCount, device_info.EcgSampleRate
+# device_info.AccChannelCount, device_info.AccSampleRate
+# device_info.GyroChannelCount, device_info.GyroSampleRate
+# device_info.BrthChannelCount, device_info.BrthSampleRate
+# device_info.MagAngleChannelCount, device_info.MagAngleSampleRate
+# device_info.MTUSize
 ```
 
-### 17. Init data transfer
+### Init data transfer
 
-Use `def init(packageSampleCount: int, powerRefreshInterval: int) -> bool`.
-
-Please call after device in 'Ready' state, return True if init succeed.
+Use `init(package_sample_count: int, power_refresh_interval: int) -> bool`. Call when the device is `Ready`. Returns `True` on success.
 
 ```python
-success = sensorProfile.init(5, 60*1000)
+success = sensor_profile.init(5, 60 * 1000)
 ```
 
-packageSampleCount:   set sample counts of SensorData.channelSamples in onDataCallback()
-powerRefreshInterval: callback period for onPowerChanged()
+- `package_sample_count`: number of samples per channel in each `onDataCallback` packet
+- `power_refresh_interval`: interval in ms between `onPowerChanged` callbacks
 
-### 18. Check if init data transfer succeed
-
-Use `property hasInited: bool` to check if init data transfer succeed.
+### Check initialization
 
 ```python
-hasInited = sensorProfile.hasInited
+has_inited = sensor_profile.hasInited
 ```
 
-### 19. DataNotify
+### Data notification
 
-Use `def startDataNotification() -> bool` to start data notification.
+#### Start data transfer
 
-Please call if hasInited return True
-
-#### 19.1 Start data transfer
+Call `startDataNotification() -> bool` after `hasInited` is `True`:
 
 ```python
-success = sensorProfile.startDataNotification()
+success = sensor_profile.startDataNotification()
 ```
 
-Data type list：
+Supported data types:
 
 ```python
-class DataType(Enum):
-    NTF_ACC = 0x1  # unit is g
-    NTF_GYRO = 0x2  # unit is degree/s
-    NTF_EEG = 0x10  # unit is uV
-    NTF_ECG = 0x11  # unit is uV
-    NTF_BRTH = 0x15  # unit is uV
+class DataType(IntEnum):
+    NTF_ACC = 0x1           # accelerometer, unit is g
+    NTF_GYRO = 0x2          # gyroscope, unit is degree/s
+    NTF_EMG = 0x8           # EMG, unit is uV
+    NTF_MAG_ANGLE_DATA = 0x0D  # NeuCir angle 0–100%
+    NTF_EEG = 0x10          # EEG, unit is uV
+    NTF_ECG = 0x11          # ECG, unit is uV
+    NTF_IMPEDANCE = 0x12    # impedance
+    NTF_IMU = 0x13          # combined ACC + GYRO
+    NTF_ADS = 0x14          # unitless ADS data
+    NTF_BRTH = 0x15         # breathing, unit is uV
+    NTF_IMPEDANCE_EXT = 0x16  # extended impedance
 ```
 
-Process data in onDataCallback.
+Process data in `onDataCallback`:
 
 ```python
 def on_data_callback(sensor, data):
@@ -294,89 +297,99 @@ def on_data_callback(sensor, data):
     elif data.dataType == DataType.NTF_ECG:
         pass
 
-    # process data as you wish
-    for oneChannelSamples in data.channelSamples:
-        for sample in oneChannelSamples:
+    for channel_samples in data.channelSamples:
+        for sample in channel_samples:
             if sample.isLost:
-                # do some logic
                 pass
             else:
-                # draw with sample.data & sample.channelIndex
-                # print(f"{sample.channelIndex} | {sample.sampleIndex} | {sample.data} | {sample.impedance}")
+                # sample.data, sample.channelIndex, sample.sampleIndex
+                # sample.impedance, sample.saturation, sample.timeStampInMs
                 pass
 
-sensorProfile.onDataCallback = on_data_callback
+sensor_profile.onDataCallback = on_data_callback
 ```
 
-#### 19.2 Stop data transfer
-
-Use `def stopDataNotification() -> bool` to stop data transfer.
+#### Stop data transfer
 
 ```python
-success = sensorProfile.stopDataNotification()
+success = sensor_profile.stopDataNotification()
 ```
 
-#### 19.3 Check if it's data transfering
-
-Use `property isDataTransfering: bool` to check if it's data transfering.
+#### Check if streaming
 
 ```python
-isDataTransfering = sensorProfile.isDataTransfering
+is_transferring = sensor_profile.isDataTransfering
 ```
 
-### 20. Get battery level
-
-Use `def getBatteryLevel() -> int` to get battery level. Please call after device in 'Ready' state.
+### Battery level
 
 ```python
-batteryPower = sensorProfile.getBatteryLevel()
-
-# batteryPower is battery level returned, value ranges from 0 to 100, 0 means out of battery, while 100 means full.
+battery_power = sensor_profile.getBatteryLevel()
+# 0–100; -1 if unknown
 ```
 
-Please check console.py in examples directory
+### setParam
 
-### Async methods
-
-all methods start with async is async methods, they has same params and return result as sync methods.
-
-Please check async_console.py in examples directory
-
-### setParam method
-
-Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor profile. Please call after device in 'Ready' state.
-
-Below is available key and value:
+Use `setParam(key: str, value: str) -> str` when the device is `Ready`. Returns `"OK"` on success.
 
 ```python
-result = sensorProfile.setParam("NTF_EMG", "ON")
-# set EMG data to ON or OFF, result is "OK" if succeed
+sensor_profile.setParam("NTF_EMG", "ON")        # ON or OFF
+sensor_profile.setParam("NTF_EEG", "ON")        # ON or OFF
+sensor_profile.setParam("NTF_ECG", "ON")        # ON or OFF
+sensor_profile.setParam("NTF_IMU", "ON")        # ON or OFF
+sensor_profile.setParam("NTF_BRTH", "ON")       # ON or OFF
+sensor_profile.setParam("NTF_IMPEDANCE", "ON")  # ON or OFF
 
-result = sensorProfile.setParam("NTF_EEG", "ON")
-# set EEG data to ON or OFF, result is "OK" if succeed
+sensor_profile.setParam("FILTER_50HZ", "ON")    # 50 Hz notch filter
+sensor_profile.setParam("FILTER_60HZ", "ON")    # 60 Hz notch filter
+sensor_profile.setParam("FILTER_HPF", "ON")     # 0.5 Hz high-pass filter
+sensor_profile.setParam("FILTER_LPF", "ON")     # 80 Hz low-pass filter
 
-result = sensorProfile.setParam("NTF_ECG", "ON")
-# set ECG data to ON or OFF, result is "OK" if succeed
+sensor_profile.setParam("DEBUG_BLE_DATA_PATH", "/absolute/path/to/debug.csv")
 
-result = sensorProfile.setParam("NTF_IMU", "ON")
-# set IMU data to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("NTF_BRTH", "ON")
-# set BRTH data to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_50HZ", "ON")
-# set 50Hz notch filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_60HZ", "ON")
-# set 60Hz notch filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_HPF", "ON")
-# set 0.5Hz hpf filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_LPF", "ON")
-# set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
-# set debug ble data path, result is "OK" if succeed
-# please give an absolute path and make sure it is valid and writeable by yourself
+# NeuCir-specific
+sensor_profile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
+sensor_profile.setParam("NEUCIR_APP_CONTROL", "OPEN")   # OPEN, CLOSE, or STOP
 ```
+
+## Async methods
+
+Methods prefixed with `async` are coroutine equivalents of their sync counterparts:
+
+| Sync | Async |
+|------|-------|
+| `scan()` | `asyncScan()` |
+| `connect()` | `asyncConnect()` |
+| `disconnect()` | `asyncDisconnect()` |
+| `init()` | `asyncInit()` |
+| `getBatteryLevel()` | `asyncGetBatteryLevel()` |
+| `startDataNotification()` | `asyncStartDataNotification()` |
+| `stopDataNotification()` | `asyncStopDataNotification()` |
+| `setParam()` | `asyncSetParam()` |
+
+See `examples/async_console.py` for usage.
+
+## Exceptions
+
+The SDK raises typed exceptions (exported from `sensor`) for error conditions:
+
+| Exception | Description |
+|-----------|-------------|
+| `SensorError` | Base class for all SDK errors |
+| `SensorTerminatedError` | SDK has been terminated |
+| `SensorNotConnectedError` | Device is not connected |
+| `SensorNotReadyError` | Device is not in `Ready` state |
+| `SensorNotInitializedError` | `init()` has not been called |
+| `InvalidDeviceServiceError` | Unsupported device service UUID |
+| `DataNotificationInProgressError` | Start/stop notification already in progress |
+| `StartDataNotificationError` | Failed to start data notification |
+| `StopDataNotificationError` | Failed to stop data notification |
+| `DataContextInitInProgressError` | Initialization already in progress |
+| `DataContextInitError` | Data context initialization failed |
+| `DataContextStopStreamingError` | Failed to stop streaming |
+| `DataContextNotTransferringError` | Operation requires active streaming |
+| `DataContextReadSamplesError` | Error reading or processing samples |
+
+## License
+
+MIT — see [LICENSE.txt](LICENSE.txt).

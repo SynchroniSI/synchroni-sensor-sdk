@@ -1,6 +1,45 @@
 /build/
 /.conda/
 /dist/
-/sensor_sdk.egg-info/
-/synchroni_sensor_sdk.egg-info/
 /.vscode/
+
+__pycache__/
+*.py[cod]
+
+# Packaging
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Song files
+songs/
+
+# recordings
+*.csv
+*metadata.json
+
+# mypy
+.mypy_cache/
+
+# Logs
+*.log
+
+# Database
+*.db
+
+# CSV exports
+*.zip
+*.csv
+
+# Dist
+dist/
+build/

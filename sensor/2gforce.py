@@ -1,5 +1,4 @@
 import asyncio
-import platform
 import queue
 import struct
 from asyncio import Queue
@@ -406,22 +405,34 @@ class GForce:
         disconnect_cb: Callable[..., None],
         buf: queue.Queue[bytes],
     ) -> None:
-        if platform.system() == "Darwin":
-            loop = asyncio.get_running_loop()
-            asyncio.set_event_loop(loop)
+        # 强制使用当前运行的 loop，不再跨 loop 调度 / Use current running loop; no cross-loop scheduling.
+        loop = asyncio.get_running_loop()
+        # 在 macOS 上显式设置 loop 有助于避免一些环境问题 / Explicit loop on macOS avoids env issues.
+        asyncio.set_event_loop(loop)
 
+        print(f"[DEBUG] GForce.connect running on loop: {id(loop)}", flush=True)
+
+        # 直接使用 BLEDevice 对象创建 client，它会绑定到当前 loop / Create client from BLEDevice; bound to current loop.
         client = BleakClient(self._device, disconnected_callback=disconnect_cb)
         self.client = client
         self.device_name = self._device.name
         self._raw_data_buf = buf
 
+        import platform
+
+        # 重试逻辑 / Retry logic
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                print(f"[DEBUG] Connection attempt {attempt + 1}/{max_retries}", flush=True)
+                # 直接 await，不要使用 async_call 跨 loop / Await directly; do not use async_call across loops.
                 await asyncio.wait_for(client.connect(), timeout=sensor_utils._TIMEOUT)
+
+                # 等待连接稳定 / Wait for connection to stabilise
                 await asyncio.sleep(0.5)
 
                 if client.is_connected:
+                    print(f"[SUCCESS] Connected on attempt {attempt + 1}", flush=True)
                     break
             except Exception as e:
                 print(f"[ERROR] Connection attempt {attempt + 1} failed: {e}", flush=True)
@@ -435,6 +446,11 @@ class GForce:
             return
 
         try:
+            # macOS 上可能需要显式获取服务 / On macOS we may need to discover services explicitly.
+            if platform.system() == "Darwin":
+                services = await client.get_services()
+                print(f"[DEBUG] Services discovered: {services}", flush=True)
+
             if not self._is_universal_stream:
                 await asyncio.wait_for(
                     client.start_notify(self.cmd_char, self._on_cmd_response), timeout=sensor_utils._TIMEOUT
@@ -444,37 +460,35 @@ class GForce:
                     client.start_notify(self.data_char, self._on_universal_response), timeout=sensor_utils._TIMEOUT
                 )
 
+            print("[DEBUG] Notifications started successfully", flush=True)
+
         except Exception as e:
             print(f"[ERROR] Failed to start notifications: {e}", flush=True)
             await client.disconnect()
             return
 
     def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray) -> None:
-        # bs = bytes(bs)
+        bs = bytes(bs)
 
-        # full_packet = []
+        full_packet = []
 
-        # is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
-        # if is_partial_data:
-        #     packet_id = bs[1]
-        #     if self.packet_id != 0 and self.packet_id != packet_id + 1:
-        #         raise Exception(
-        #             "Unexpected packet id: expected {} got {}".format(
-        #                 self.packet_id + 1,
-        #                 packet_id,
-        #             )
-        #         )
-        #     elif self.packet_id == 0 or self.packet_id > packet_id:
-        #         self.packet_id = packet_id
-        #         self.data_packet += bs[2:]
+        is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
+        if is_partial_data:
+            packet_id = bs[1]
+            if self.packet_id != 0 and self.packet_id != packet_id + 1:
+                raise Exception(
+                    f"Unexpected packet id: expected {self.packet_id + 1} got {packet_id}"
+                )
+            elif self.packet_id == 0 or self.packet_id > packet_id:
+                self.packet_id = packet_id
+                self.data_packet += bs[2:]
 
-        #         if self.packet_id == 0:
-        #             full_packet = self.data_packet
-        #             self.data_packet = []
-        # else:
-        #     full_packet = bs
+                if self.packet_id == 0:
+                    full_packet = self.data_packet
+                    self.data_packet = []
+        else:
+            full_packet = bs
 
-        full_packet = bs
         if len(full_packet) == 0:
             return
 
@@ -915,6 +929,7 @@ class GForce:
             return q
 
     async def _send_request(self, req: Request) -> bytes | None:
+        # 直接调用内部方法，不再跨 loop / Call internal method directly; no cross-loop.
         return await self._send_request_internal(req=req)
 
     async def _send_request_internal(self, req: Request) -> bytes | None:
@@ -939,8 +954,10 @@ class GForce:
 
         # print(str(req.cmd) + str(req.body))
         try:
+            # 直接 write，不再跨 loop / Write directly; no cross-loop.
             await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), timeout=1)
         except Exception:
+            # print(f"Write char failed: {e}")
             self.responses[req.cmd] = None
             return None
 

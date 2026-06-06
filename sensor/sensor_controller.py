@@ -1,28 +1,25 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import bleak
-
-from sensor import sensor_profile
-from sensor import sensor_utils
-from sensor.sensor_profile import DeviceStateEx, SensorProfile
-
-from sensor.sensor_utils import async_call, sync_call, async_exec
 from bleak import (
-    BleakScanner,
     AdvertisementData,
+    BleakScanner,
 )
+
+from sensor import sensor_profile, sensor_utils
+from sensor.sensor_profile import DeviceStateEx, SensorProfile
+from sensor.sensor_utils import async_call, async_exec, sync_call
 
 SERVICE_GUID = "0000ffd0-0000-1000-8000-00805f9b34fb"
 RFSTAR_SERVICE_GUID = "00001812-0000-1000-8000-00805f9b34fb"
 
 
 class SensorController:
-    _instance_lock = threading.Lock()
+    _instance_lock: threading.Lock = threading.Lock()
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls: type["SensorController"], *args: object, **kwargs: object) -> "SensorController":
         if not hasattr(SensorController, "_instance"):
             with SensorController._instance_lock:
                 if not hasattr(SensorController, "_instance"):
@@ -32,26 +29,26 @@ class SensorController:
 
     """
     SensorController 类的操作包括扫描蓝牙设备以及回调，创建SensorProfile等。
+    SensorController: scan BLE devices, callbacks, and create SensorProfile instances.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """
-        初始化 SensorController 实例。
+        初始化 SensorController 实例。 / Initialize a SensorController instance.
         """
-        self._is_scanning = False
-        self._scanner: BleakScanner = None
-        self._device_callback: Callable[[List[sensor_profile.BLEDevice]], None] = None
-        self._device_callback_period = 0
-        self._enable_callback: Callable[[bool], None] = None
-        self._sensor_profiles: Dict[str, SensorProfile] = dict()
+        self._is_scanning: bool = False
+        self._scanner: BleakScanner | None = None
+        self._device_callback: Callable[[list[sensor_profile.BLEDevice]], None] | None = None
+        self._device_callback_period: int = 0
+        self._enable_callback: Callable[[bool], None] | None = None
+        self._sensor_profiles: dict[str, SensorProfile] = dict()
 
     def __del__(self) -> None:
         """
-        反初始化 SensorController 类的实例。
-
+        反初始化 SensorController 类的实例。 / Tear down the SensorController instance.
         """
 
-    def terminate(self):
+    def terminate(self) -> None:
         sensor_utils._terminated = True
 
         for sensor in self._sensor_profiles.values():
@@ -60,12 +57,12 @@ class SensorController:
 
         sensor_utils.Terminate()
 
-    def _match_device(self, _device: bleak.BLEDevice, adv: AdvertisementData):
-        if _device.name == None:
+    def _match_device(self, _device: bleak.BLEDevice, adv: AdvertisementData) -> bool:
+        if _device.name is None:
             return False
 
         if SERVICE_GUID in adv.service_uuids:
-            # print("Device found: {0}, RSSI: {1}".format(_device.name, adv.rssi))
+            print(f"Device found: {_device.name}, RSSI: {adv.rssi}")
             return True
 
         return False
@@ -73,18 +70,16 @@ class SensorController:
     @property
     def isScanning(self) -> bool:
         """
-        检查是否正在扫描。
-
-        :return:            bool: 是否正在扫描
+        检查是否正在扫描。 / Check whether scanning is in progress.
+        :return: bool: 是否正在扫描 / True if scanning.
         """
         return self._is_scanning
 
     @property
     def isEnable(self) -> bool:
         """
-        检查蓝牙是否启用。
-
-        :return:            bool: 是否启用
+        检查蓝牙是否启用。 / Check whether Bluetooth is enabled.
+        :return: bool: 是否启用 / True if enabled.
         """
         return True
 
@@ -92,34 +87,33 @@ class SensorController:
     def onEnableCallback(self, callback: Callable[[bool], None]):
         """
         设置蓝牙开关变化回调，当系统蓝牙开关发生变化时调用。
+        Set callback for Bluetooth enable/disable changes.
 
-        :param            callback (Callable[[bool], None]): 扫描蓝牙开关状态回调函数
+        :param callback: 蓝牙开关状态回调 / Callback(enabled: bool).
         """
         self._enable_callback = callback
 
     @property
     def hasDeviceFoundCallback(self) -> bool:
         """
-        检查是否有扫描设备回调。
-
-        :return:            bool: 是否有设备回调
+        检查是否有扫描设备回调。 / Check whether device-found callback is set.
+        :return: bool: 是否有设备回调 / True if callback is set.
         """
         return self._device_callback != None
 
     @hasDeviceFoundCallback.setter
-    def onDeviceFoundCallback(self, callback: Callable[[List[sensor_profile.BLEDevice]], None]):
+    def onDeviceFoundCallback(self, callback: Callable[[list[sensor_profile.BLEDevice]], None]):
         """
-        设置扫描设备回调。
-
-        :param            callback (Callable[[List[BLEDevice]], None]): 扫描设备回调函数
+        设置扫描设备回调。 / Set callback for discovered devices.
+        :param callback: 扫描设备回调，接收 BLEDevice 列表 / Callback(devices: List[BLEDevice]).
         """
         self._device_callback = callback
 
     def _process_ble_devices(
-        self, found_devices: Dict[str, Tuple[bleak.BLEDevice, AdvertisementData]]
-    ) -> List[sensor_profile.BLEDevice]:
-        devices: List[sensor_profile.BLEDevice] = list()
-        deviceMap: Dict[str, SensorProfile] = self._sensor_profiles.copy()
+        self, found_devices: dict[str, tuple[bleak.BLEDevice, AdvertisementData]]
+    ) -> list[sensor_profile.BLEDevice]:
+        devices: list[sensor_profile.BLEDevice] = list()
+        deviceMap: dict[str, SensorProfile] = self._sensor_profiles.copy()
         for uuid in found_devices:
             device = found_devices[uuid][0]
             if device.name == None:
@@ -146,63 +140,59 @@ class SensorController:
         self._sensor_profiles = deviceMap
         return devices
 
-    def _init_scan(self):
-        if self._scanner == None:
+    def _init_scan(self) -> None:
+        if self._scanner is None:
             self._scanner = BleakScanner(
                 detection_callback=self._match_device,
                 service_uuids=[SERVICE_GUID, RFSTAR_SERVICE_GUID],
             )
 
-    async def _async_scan(self, period):
+    async def _async_scan(self, period: int) -> list[sensor_profile.BLEDevice]:
         self._is_scanning = True
         self._init_scan()
         found_devices = await self._scanner.discover(timeout=period / 1000, return_adv=True)
         self._is_scanning = False
         return self._process_ble_devices(found_devices)
 
-    def scan(self, period) -> List[sensor_profile.BLEDevice]:
+    def scan(self, period: int) -> list[sensor_profile.BLEDevice]:
         """
-        扫描一段时间后返回BLEDevice列表。
-
-        :param            periodInMs (int): 扫描时长（毫秒）
-
-        :return:           List[sensor_profile.BLEDevice]： BLEDevice列表
+        扫描一段时间后返回 BLEDevice 列表。 / Scan for a period and return list of BLEDevice.
+        :param period: 扫描时长（毫秒）/ Scan duration in milliseconds.
+        :return: List[BLEDevice]: 发现的设备列表 / List of discovered devices.
         """
         return sync_call(self._async_scan(period))
 
-    async def asyncScan(self, period) -> List[sensor_profile.BLEDevice]:
+    async def asyncScan(self, period: int) -> list[sensor_profile.BLEDevice]:
         """
-        扫描一段时间后返回BLEDevice列表。
-
-        :param            periodInMs (int): 扫描时长（毫秒）
-
-        :return:           List[sensor_profile.BLEDevice]： BLEDevice列表
+        扫描一段时间后返回 BLEDevice 列表。 / Scan for a period and return list of BLEDevice (async).
+        :param period: 扫描时长（毫秒）/ Scan duration in milliseconds.
+        :return: List[BLEDevice]: 发现的设备列表 / List of discovered devices.
         """
         return await async_call(self._async_scan(period))
 
-    async def _device_scan_callback(self, devices: List[sensor_profile.BLEDevice]):
+    async def _device_scan_callback(self, devices: list[sensor_profile.BLEDevice]) -> None:
         if not sensor_utils._terminated and self._device_callback:
             try:
                 asyncio.get_event_loop().run_in_executor(None, self._device_callback, devices)
             except Exception as e:
-                raise RuntimeError("Scan device fail: %s" % (e))
+                print(e)
 
         if not sensor_utils._terminated and self._is_scanning:
             async_exec(self._startScan())
 
-    async def _startScan(self) -> bool:
+    async def _startScan(self) -> None:
         self._init_scan()
+        if self._scanner is None:
+            return
         found_devices = await self._scanner.discover(timeout=self._device_callback_period / 1000, return_adv=True)
         devices = self._process_ble_devices(found_devices)
         async_exec(self._device_scan_callback(devices))
 
     def startScan(self, periodInMs: int) -> bool:
         """
-        开始扫描。
-
-        :param            periodInMs (int): 扫描时长（毫秒）
-
-        :return:            bool: 扫描是否成功启动
+        开始扫描。 / Start scanning.
+        :param periodInMs: 扫描时长（毫秒）/ Scan duration in milliseconds.
+        :return: bool: 是否成功启动 / True if started.
         """
         if self._is_scanning:
             return True
@@ -215,20 +205,18 @@ class SensorController:
 
     def stopScan(self) -> None:
         """
-        停止扫描。
+        停止扫描。 / Stop scanning.
         """
         if not self._is_scanning:
             return
 
         self._is_scanning = False
 
-    def requireSensor(self, device: sensor_profile.BLEDevice) -> Optional[SensorProfile]:
+    def requireSensor(self, device: sensor_profile.BLEDevice) -> SensorProfile | None:
         """
-        根据设备信息获取或创建SensorProfile。
-
-        :param            device (BLEDevice): 蓝牙设备信息
-
-        :return:            Optional[SensorProfile]: SensorProfile
+        根据设备信息获取或创建 SensorProfile。 / Get or create SensorProfile for a BLE device.
+        :param device: 蓝牙设备信息 / BLE device info.
+        :return: SensorProfile or None / The SensorProfile for this device.
         """
         if self._sensor_profiles.get(device.Address) == None:
             newSensor = SensorProfile(device)
@@ -236,36 +224,32 @@ class SensorController:
 
         return self._sensor_profiles[device.Address]
 
-    def getSensor(self, deviceMac: str) -> Optional[SensorProfile]:
+    def getSensor(self, deviceMac: str) -> SensorProfile | None:
         """
-        根据设备 MAC 地址获取SensorProfile。
-
-        :params deviceMac (str): 设备 MAC 地址
-
-        :return:  Optional[SensorProfile]: SensorProfile
+        根据设备 MAC 地址获取 SensorProfile。 / Get SensorProfile by device MAC address.
+        :param deviceMac: 设备 MAC 地址 / Device MAC address.
+        :return: SensorProfile or None / The SensorProfile, or None.
         """
         return self._sensor_profiles[deviceMac]
 
-    def getConnectedSensors(self) -> List[SensorProfile]:
+    def getConnectedSensors(self) -> list[SensorProfile]:
         """
-        获取已连接的SensorProfile列表。
-
-        :return:            List[SensorProfile]: 已连接的SensorProfile列表
+        获取已连接的 SensorProfile 列表。 / Get list of connected SensorProfiles.
+        :return: List[SensorProfile]: 已连接的传感器列表 / List of connected sensors.
         """
-        sensors: List[SensorProfile] = list()
+        sensors: list[SensorProfile] = list()
         for sensor in self._sensor_profiles.values():
             if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 sensors.append(sensor)
 
         return sensors
 
-    def getConnectedDevices(self) -> List[sensor_profile.BLEDevice]:
+    def getConnectedDevices(self) -> list[sensor_profile.BLEDevice]:
         """
-        获取已连接的蓝牙设备列表。
-
-        :return:            List[BLEDevice]: 已连接的蓝牙设备列表
+        获取已连接的蓝牙设备列表。 / Get list of connected BLE devices.
+        :return: List[BLEDevice]: 已连接的设备列表 / List of connected devices.
         """
-        devices: List[sensor_profile.BLEDevice] = list()
+        devices: list[sensor_profile.BLEDevice] = list()
         for sensor in self._sensor_profiles.values():
             if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 devices.append(sensor.BLEDevice)

@@ -40,6 +40,9 @@ songs/
 *.zip
 *.csv
 
+# v2 comparison captures
+v2_comparison/captures/
+
 # Dist
 dist/
 build/

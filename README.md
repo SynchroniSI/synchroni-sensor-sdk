@@ -1,407 +1,205 @@
 # synchroni-sensor-sdk
 
-Python SDK for interfacing with Synchroni BLE sensor devices.
+Python SDK for Synchroni BLE sensor devices (EEG, EMG, ECG, IMU, and more).
 
-## Requirements
+**Requirements:** Python 3.10+, Bluetooth enabled.
 
-- Python 3.10+
-- Bluetooth enabled on the host machine
-
-## Installation
+## Install
 
 ```sh
 pip install synchroni-sensor-sdk
-
-# Or install with poetry
-poetry add synchroni-sensor-sdk
+# Optional multi-adapter (dedicated USB HCI dongles):
+pip install "synchroni-sensor-sdk[managed-usb]"
 ```
 
-To install from source for development:
+From source:
 
 ```sh
 git clone https://github.com/SynchroniSI/synchroni-sensor-sdk.git
 cd synchroni-sensor-sdk
-pip install .
+poetry install
+# with Bumble for multi-adapter:
+poetry install --extras managed-usb
 ```
 
-Or with [Poetry](https://python-poetry.org/):
+## Multi-adapter (optional)
+
+Route each sensor through a dedicated USB Bluetooth dongle (Bumble/libusb) with
+`SensorHub(enable_multi_adapter=True)`. This **isolates radios**; it does **not**
+provide hardware sample-clock sync.
+
+Full workflows (inventory, Windows claim, single- and multi-dongle scan/connect,
+session claims, firmware env vars): **[docs/APIv2.md — Multi-adapter](docs/APIv2.md#multi-adapter-experimental)**.
+
+### Quick workflow
+
+```python
+from synchroni_sensor_sdk import SensorHub
+
+with SensorHub(enable_multi_adapter=True) as hub:
+    # Windows: bind known EEG dongles to WinUSB once if claim_required
+    for a in hub.list_bluetooth_adapters():
+        if a.claim_required:
+            hub.claim_adapter(a.id)
+
+    # Discover on free managed dongles (or use scan(adapter_id=…))
+    devices = hub.scan_managed_usb(timeout_ms=2000)
+    if not devices:
+        raise RuntimeError("No sensors on managed radios")
+
+    d = max(devices, key=lambda x: x.rssi)
+    sensor = hub.connect(d.mac_address, adapter_id=d.adapter_id)
+    sensor.init(package_sample_count=10, power_refresh_interval=5000)
+    sensor.start_streaming()
+    # disconnect tears down GATT only; hub.close() (context exit) frees dongles
+```
+
+### CLI smoke tests
 
 ```sh
-poetry install
+poetry install --extras managed-usb
+poetry run python examples/v2_cli.py list-adapters
+poetry run python examples/v2_cli.py scan --adapter-id usb:…
+poetry run python examples/v2_cli.py connect --adapter-id usb:… --stream-seconds 5
+poetry run python examples/v2_cli.py collect --adapter-id usb:… -o ./session.csv
+poetry run python examples/v2_cli.py clean -y
 ```
 
-## Quick start
+Useful env vars: `SYNCHRONI_WINUSB_INSTALLER`, `SYNCHRONI_SDK_ASSETS_MANIFEST_URL`,
+`SYNCHRONI_RTK_FIRMWARE_AUTO=0` (disable Realtek host firmware auto-download).
 
-The SDK requests Bluetooth permissions automatically on supported platforms.
+## Quick start (v2)
+
+Scan, connect, stream EEG, and print samples:
 
 ```python
-from sensor import *
+from synchroni_sensor_sdk import SensorHub
+from synchroni_sensor_sdk.core.data import NtfDataType
+from synchroni_sensor_sdk.core.device import SetParamCommand
+
+with SensorHub() as hub:
+    devices = hub.scan(timeout_ms=5000)
+    if not devices:
+        raise Exception("No devices found")
+
+    sensor = hub.connect(devices[0].mac_address)
+    sensor.set_param(SetParamCommand(
+        enable_ntf_ecg=False,
+        enable_ntf_imu=False,
+        enable_filter_50hz=False,
+        enable_filter_60hz=False,
+        enable_filter_hpf=False,
+        enable_filter_lpf=False,
+    ))
+    sensor.init(package_sample_count=10, power_refresh_interval=5000)
+
+    def on_data(data):
+        if data.data_type == NtfDataType.NTF_EEG and data.channel_samples:
+            for sample in data.channel_samples[0]:
+                print(sample.data)
+
+    sensor.register_data_callback(on_data)
+    sensor.start_streaming()
+
+    input("Press Enter to stop...")
+    sensor.stop_streaming()
 ```
 
-`SensorController` is a singleton. A pre-created instance is available as `SensorControllerInstance`:
+Async API — same flow with `await` and `async with`:
 
 ```python
-controller = SensorControllerInstance  # equivalent to SensorController()
+from synchroni_sensor_sdk.async_api import SensorHub
+
+async with SensorHub() as hub:
+    devices = await hub.scan(timeout_ms=5000)
+    sensor = await hub.connect(devices[0].mac_address)
+    # await sensor.init(...), await sensor.start_streaming(), etc.
 ```
 
-See the [examples](examples/) directory for full working scripts:
+See [examples/v2_console.py](examples/v2_console.py) and [examples/v2_async_console.py](examples/v2_async_console.py) for full demos.
 
-- `console.py` — synchronous scan, connect, and stream
-- `async_console.py` — async equivalents
-- `SynchroniSDKPython_Demo.py` / `SynchroniSDKPython_DemoEMG.py` — GUI demos
+## Development CLI
 
-For a class-by-class overview of the API (including sync vs async methods), see the [API reference](docs/API.md).
+For local smoke tests, [examples/v2_cli.py](examples/v2_cli.py) is a small Typer CLI (Typer is a **dev** dependency: `poetry install`).
 
-## SensorController methods
-
-### Initialize
-
-```python
-controller = SensorController()
-
-# register scan listener
-if not controller.hasDeviceFoundCallback:
-    def on_device_callback(device_list: list[BLEDevice]):
-        # called periodically with discovered devices
-        pass
-
-    controller.onDeviceFoundCallback = on_device_callback
+```sh
+poetry install --extras managed-usb   # needed for multi-adapter inventory / USB radios
+poetry run python examples/v2_cli.py --help
 ```
 
-### Start scan
+| Command | Description |
+|---------|-------------|
+| `list-adapters` | List host Bluetooth adapters (system + managed USB inventory) |
+| `scan` | Scan for nearby sensors |
+| `connect` | Scan/connect (default radio: `system:default`); stream briefly; print sample stats |
+| `collect` | Like `connect`, but write all samples to a CSV file |
+| `clean` | Wipe WinUSB installer cache, RTK host firmware cache, and pin firmware blobs |
 
-Use `startScan(period_in_ms: int) -> bool` to start continuous scanning:
+Commands live under `examples/cli/` (`app.py`, display helpers, connect/collect session). Launch with
+`examples/v2_cli.py`.
 
-```python
-success = controller.startScan(6000)
+```sh
+# List adapters (capability notes + id / source / claim flags)
+poetry run python examples/v2_cli.py list-adapters
+
+# System BLE scan (3s default)
+poetry run python examples/v2_cli.py scan
+
+# Longer scan and/or a specific radio
+poetry run python examples/v2_cli.py scan --timeout-ms 5000
+poetry run python examples/v2_cli.py scan --adapter-id system:default
+poetry run python examples/v2_cli.py scan --adapter-id usb:…
+
+# Connect + short stream (default radio is system:default; strongest RSSI unless --mac)
+poetry run python examples/v2_cli.py connect
+poetry run python examples/v2_cli.py connect --adapter-id usb:… --stream-seconds 3
+poetry run python examples/v2_cli.py connect --mac AA:BB:CC:DD:EE:FF
+
+# Collect samples to CSV (default filename in cwd; override with -o)
+poetry run python examples/v2_cli.py collect --stream-seconds 10
+poetry run python examples/v2_cli.py collect --adapter-id usb:… -o ./session.csv
+
+# Clear cached installers / host firmware (skips prompt with -y)
+poetry run python examples/v2_cli.py clean -y
 ```
 
-Returns `True` if scanning started. `period_in_ms` controls how often `onDeviceFoundCallback` is invoked.
+All commands use `SensorHub(enable_multi_adapter=True)`. Managed-USB options require the
+`managed-usb` extra (Bumble).
 
-Use `scan(period_in_ms: int) -> list[BLEDevice]` for a one-shot scan:
+## Concurrency
 
-```python
-ble_devices = controller.scan(6000)
-```
+### Sync API
 
-### Stop scan
+The sync API runs BLE I/O on a **background event loop** thread (`EventLoopRunner`). Your main thread only blocks while waiting for hub/sensor method calls to finish (`scan`, `connect`, `init`, etc.).
 
-```python
-controller.stopScan()
-```
+**Callbacks (data, power, state, error)**
 
-### Check scanning status
+| | Detail |
+|---|--------|
+| Thread | Sync callbacks run on a **thread-pool worker** via `asyncio.to_thread` — not the main thread and not the BLE loop thread itself |
+| Main thread | **Not blocked** by callbacks while it is free (e.g. sleeping or in your own loop) |
+| Ordering | Dispatch for a given callback type is sequential: each invocation is awaited before the next |
+| Throughput | Slow handlers can cause the drop-oldest data buffer (default 64 packets) to discard data; that is buffer pressure, not main-thread blocking |
 
-```python
-is_scanning = controller.isScanning
-```
+**Do not call blocking hub/sensor methods from a sync callback** (`connect`, `disconnect`, `start_streaming`, `stop_streaming`, etc.). Those schedule work on the same background loop the dispatch task is waiting on and will **deadlock**.
 
-### Check if Bluetooth is enabled
+The continuous-scan **device-found** callback runs on the **hub loop thread**, so the same rule applies: only do lightweight work, or enqueue work for the main thread.
 
-```python
-is_enabled = controller.isEnable
-```
+Pattern used in [examples/v2_console.py](examples/v2_console.py): queue reconnect/restart work from callbacks and process it on the main thread.
 
-Register a callback for Bluetooth enable/disable changes:
+### Async API
 
-```python
-controller.onEnableCallback = lambda enabled: print(f"Bluetooth enabled: {enabled}")
-```
+All I/O is `await`ed on the caller's event loop. Prefer **async** callbacks (`async def`) so work can run without leaving the loop. If you register a sync callback, it still uses `asyncio.to_thread` and follows the same “no blocking hub calls from the callback” rule if you mix patterns incorrectly—prefer async handlers that `await` hub/sensor methods.
 
-### Create SensorProfile
+## Documentation
 
-Use `requireSensor(device: BLEDevice) -> SensorProfile | None` to get or create a `SensorProfile` for a device:
+| Doc | Description |
+|-----|-------------|
+| [docs/APIv2.md](docs/APIv2.md) | v2 API reference (`synchroni_sensor_sdk`), including multi-adapter workflows |
+| [docs/API.md](docs/API.md) | Legacy API reference (`sensor` package) |
+| [examples/](examples/) | Console demos, GUI, and [v2_cli.py](examples/v2_cli.py) Typer smoke-test CLI |
 
-```python
-sensor_profile = controller.requireSensor(ble_device)
-```
 
-### Get SensorProfile
-
-Use `getSensor(device_mac: str) -> SensorProfile | None` to look up an existing profile by MAC address:
-
-```python
-sensor_profile = controller.getSensor(ble_device.Address)
-```
-
-Returns `None` if no profile exists for that address.
-
-### Get connected SensorProfiles
-
-```python
-sensor_profiles = controller.getConnectedSensors()
-```
-
-### Get connected BLE devices
-
-```python
-ble_devices = controller.getConnectedDevices()
-```
-
-### Terminate
-
-Call `terminate()` when your application exits (including on Ctrl+C) to disconnect sensors and release resources:
-
-```python
-import signal
-import time
-
-def shutdown():
-    controller.terminate()
-    exit()
-
-def main():
-    signal.signal(signal.SIGINT, lambda sig, frame: shutdown())
-    # ... your application logic ...
-    controller.terminate()
-
-if __name__ == "__main__":
-    main()
-```
-
-## SensorProfile methods
-
-### Initialize callbacks
-
-Register callbacks before connecting:
-
-```python
-sensor_profile = controller.requireSensor(ble_device)
-
-def on_state_changed(sensor, new_state):
-    # handle unexpected disconnects
-    pass
-
-def on_error_callback(sensor, reason):
-    pass
-
-def on_power_changed(sensor, power):
-    # power ranges from 0–100; -1 is invalid
-    pass
-
-def on_data_callback(sensor, data):
-    pass
-
-sensor_profile.onStateChanged = on_state_changed
-sensor_profile.onErrorCallback = on_error_callback
-sensor_profile.onPowerChanged = on_power_changed
-sensor_profile.onDataCallback = on_data_callback
-```
-
-### Connect
-
-```python
-success = sensor_profile.connect()
-```
-
-### Disconnect
-
-If data notification is currently active, `disconnect()` will automatically stop it first before closing the BLE connection.
-
-```python
-success = sensor_profile.disconnect()
-```
-
-### Device state
-
-Use `deviceState: DeviceStateEx` to check connection status. Send commands only when the device is in the `Ready` state (after `connect()` returns `True`):
-
-```python
-state = sensor_profile.deviceState
-
-# class DeviceStateEx(Enum):
-#     Disconnected = 0
-#     Connecting = 1
-#     Connected = 2
-#     Ready = 3
-#     Disconnecting = 4
-#     Invalid = 5
-```
-
-### BLE device
-
-```python
-ble_device = sensor_profile.BLEDevice
-```
-
-### Device info
-
-Use `getDeviceInfo() -> DeviceInfo | None`. Call after the device reaches `Ready` state and `init()` succeeds. Returns `None` if not initialized.
-
-```python
-device_info = sensor_profile.getDeviceInfo()
-
-# DeviceInfo attributes:
-# device_info.DeviceName
-# device_info.ModelName
-# device_info.HardwareVersion
-# device_info.FirmwareVersion
-# device_info.EmgChannelCount, device_info.EmgSampleRate
-# device_info.EegChannelCount, device_info.EegSampleRate
-# device_info.EcgChannelCount, device_info.EcgSampleRate
-# device_info.AccChannelCount, device_info.AccSampleRate
-# device_info.GyroChannelCount, device_info.GyroSampleRate
-# device_info.BrthChannelCount, device_info.BrthSampleRate
-# device_info.MagAngleChannelCount, device_info.MagAngleSampleRate
-# device_info.MTUSize
-```
-
-### Init data transfer
-
-Use `init(package_sample_count: int, power_refresh_interval: int) -> bool`. Call when the device is `Ready`. Returns `True` on success.
-
-```python
-success = sensor_profile.init(5, 60 * 1000)
-```
-
-- `package_sample_count`: number of samples per channel in each `onDataCallback` packet
-- `power_refresh_interval`: interval in ms between `onPowerChanged` callbacks
-
-### Check initialization
-
-```python
-has_inited = sensor_profile.hasInited
-```
-
-### Data notification
-
-#### Start data transfer
-
-Call `startDataNotification() -> bool` after `hasInited` is `True`:
-
-```python
-success = sensor_profile.startDataNotification()
-```
-
-Supported data types:
-
-```python
-class DataType(IntEnum):
-    NTF_ACC = 0x1           # accelerometer, unit is g
-    NTF_GYRO = 0x2          # gyroscope, unit is degree/s
-    NTF_EMG = 0x8           # EMG, unit is uV
-    NTF_MAG_ANGLE_DATA = 0x0D  # NeuCir angle 0–100%
-    NTF_EEG = 0x10          # EEG, unit is uV
-    NTF_ECG = 0x11          # ECG, unit is uV
-    NTF_IMPEDANCE = 0x12    # impedance
-    NTF_IMU = 0x13          # combined ACC + GYRO
-    NTF_ADS = 0x14          # unitless ADS data
-    NTF_BRTH = 0x15         # breathing, unit is uV
-    NTF_IMPEDANCE_EXT = 0x16  # extended impedance
-```
-
-Process data in `onDataCallback`:
-
-```python
-def on_data_callback(sensor, data):
-    if data.dataType == DataType.NTF_EEG:
-        pass
-    elif data.dataType == DataType.NTF_ECG:
-        pass
-
-    for channel_samples in data.channelSamples:
-        for sample in channel_samples:
-            if sample.isLost:
-                pass
-            else:
-                # sample.data, sample.channelIndex, sample.sampleIndex
-                # sample.impedance, sample.saturation, sample.timeStampInMs
-                pass
-
-sensor_profile.onDataCallback = on_data_callback
-```
-
-#### Stop data transfer
-
-```python
-success = sensor_profile.stopDataNotification()
-```
-
-#### Check if streaming
-
-```python
-is_transferring = sensor_profile.isDataTransfering
-```
-
-### Battery level
-
-```python
-battery_power = sensor_profile.getBatteryLevel()
-# 0–100; -1 if unknown
-```
-
-### setParam
-
-### Async methods
-
-all methods start with async is async methods, they has same params and return result as sync methods.
-
-Please check async_console.py in examples directory
-
-### setParam method
-
-Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor profile. Please call after device in 'Ready' state.
-
-The asynchronous variant is `asyncSetParam(self, key: str, value: str) -> str`.
-
-If the device is already streaming when you change an `NTF_*` or `FILTER_*` key, the SDK will stop and restart the data notification so the new setting takes effect immediately.
-
-Below is available key and value:
-
-```python
-# Data stream toggles
-result = sensorProfile.setParam("NTF_GEST", "ON")
-result = sensorProfile.setParam("NTF_EMG", "ON")
-# set EMG data to ON or OFF, result is "OK" if succeed
-
-sensor_profile.setParam("FILTER_50HZ", "ON")    # 50 Hz notch filter
-sensor_profile.setParam("FILTER_60HZ", "ON")    # 60 Hz notch filter
-sensor_profile.setParam("FILTER_HPF", "ON")     # 0.5 Hz high-pass filter
-sensor_profile.setParam("FILTER_LPF", "ON")     # 80 Hz low-pass filter
-
-sensor_profile.setParam("DEBUG_BLE_DATA_PATH", "/absolute/path/to/debug.csv")
-
-result = sensorProfile.setParam("NTF_IMU", "ON")
-# set IMU data to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("NTF_BRTH", "ON")
-# set BRTH data to ON or OFF, result is "OK" if succeed
-
-# Firmware filter toggles
-result = sensorProfile.setParam("FILTER_50HZ", "ON")
-# set 50Hz notch filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_60HZ", "ON")
-# set 60Hz notch filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_HPF", "ON")
-# set 0.5Hz hpf filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("FILTER_LPF", "ON")
-# set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
-
-result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
-# set debug ble data path, result is "OK" if succeed
-# please give an absolute path and make sure it is valid and writeable by yourself
-```
-
-
-### getParam method
-
-Use `def getParam(self, key: str) -> str` to query the current parameter state of a sensor profile. Please call after the device reaches the 'Ready' state.
-
-The asynchronous variant is `asyncGetParam(self, key: str) -> str`.
-
-Supported aggregate query keys:
-
-```python
-result = sensorProfile.getParam("FILTER")
-# Returns a pipe-separated string of all filter states, e.g.:
-# "FILTER_50HZ|ON|FILTER_60HZ|ON|FILTER_HPF|ON|FILTER_LPF|ON"
-
-result = sensorProfile.getParam("NTF")
-# Returns a pipe-separated string of all notification states, e.g.:
-# "NTF_BRTH|ON|NTF_ECG|ON|NTF_EEG|ON|NTF_EMG|ON|..."
-```
+The legacy `sensor` package remains available for existing integrations. New projects should use `synchroni_sensor_sdk`.
 
 If the key is not supported, the result starts with `"Error"`.

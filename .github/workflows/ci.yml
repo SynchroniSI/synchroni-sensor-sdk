@@ -27,16 +27,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}-all-extras
 
       - name: Install dependencies
-        run: poetry install --no-interaction
+        run: poetry install --no-interaction --all-extras
 
       - name: Ruff
-        run: poetry run ruff check .
+        run: poetry run ruff check synchroni_sensor_sdk
 
       - name: Mypy
-        run: poetry run mypy sensor
+        run: poetry run mypy synchroni_sensor_sdk sensor
 
-      # - name: Pytest
-      #   run: poetry run pytest tests/ -v
+      - name: Pytest
+        run: poetry run pytest tests/ -v

@@ -1,14 +1,18 @@
 import asyncio
 import threading
 import time
-from typing import Any
 
-_terminated: bool = False
-_TIMEOUT: int = 10
-running_tasks: set = set()
-_runloop: asyncio.AbstractEventLoop | None = None
-_event_thread: threading.Thread | None = None
-_needCloseRunloop: bool = False
+from sensor.sdk_log import SdkLog
+
+_TAG = "sensor_utils"
+
+_terminated = False
+_TIMEOUT = 10
+BLEAK_RESULT_QUEUE_MAXSIZE = 2000
+running_tasks = set()
+_runloop: asyncio.AbstractEventLoop = None
+_event_thread: threading.Thread = None
+_needCloseRunloop = False
 
 
 def checkRunLoop() -> None:
@@ -32,15 +36,15 @@ def Terminate() -> None:
     try:
         for task in asyncio.all_tasks():
             task.cancel()
-    except Exception:
-        pass
+    except Exception as e:
+        SdkLog.exception(_TAG, "Error cancelling tasks during terminate")
 
     if _needCloseRunloop:
         try:
             _runloop.stop()
             _runloop.close()
-        except Exception:
-            pass
+        except Exception as e:
+            SdkLog.exception(_TAG, "Error closing runloop during terminate")
 
 
 def async_exec(
@@ -56,8 +60,7 @@ def async_exec(
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"async_exec failed: {e}")
 
 
 def sync_call(
@@ -75,8 +78,7 @@ def sync_call(
         task.add_done_callback(lambda t: running_tasks.remove(t))
         return task.result(timeout=_timeout)
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"sync_call failed: {e}")
 
 
 async def async_call(
@@ -93,8 +95,7 @@ async def async_call(
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"async_call failed: {e}")
 
     while not _terminated and not task.done():
         await asyncio.sleep(0.1)
@@ -103,8 +104,8 @@ async def async_call(
         if not task.cancelled():
             return task.result()
     except Exception as e:
-        print(e)
-        raise
+        SdkLog.e(_TAG, f"async_call result failed: {e}")
+        return
 
 
 def start_loop(loop: asyncio.BaseEventLoop) -> None:

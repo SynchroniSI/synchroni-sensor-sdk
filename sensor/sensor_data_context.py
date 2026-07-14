@@ -1405,6 +1405,40 @@ class SensorProfileDataCtx:
             return ReadSamplesResult.Error
         if sensorData is None or sensorData.packageSampleCount <= 0 or sensorData.channelCount <= 0 or sensorData.minPackageSampleCount <= 0 or sensorData.K <= 0:
             return ReadSamplesResult.Error
+
+        def _type_name():
+            try:
+                return DataType(sensorData.dataType).name
+            except Exception:
+                return str(sensorData.dataType)
+
+        # 长度预检：在解析包序号/样本前就发现数据长度不足，并报告数据类型
+        if dataGap >= 0 and sensorData.packageSampleCount > 0:
+            if sensorData.resolutionBits in (7, 8):
+                bytesPerChannel = 1
+            elif sensorData.resolutionBits in (12, 16, 17, 0):
+                bytesPerChannel = 2
+            elif sensorData.resolutionBits == 24:
+                bytesPerChannel = 3
+            elif sensorData.resolutionBits in (31, 32, 33):
+                bytesPerChannel = 4
+            else:
+                bytesPerChannel = 2
+
+            realChannelCount = 0
+            for i in range(sensorData.channelCount):
+                if (sensorData.channelMask & (1 << i)) != 0:
+                    realChannelCount += 1
+
+            expected = (
+                dataOffset
+                + bytesPerChannel * realChannelCount * sensorData.packageSampleCount
+                + dataGap * (sensorData.packageSampleCount - 1)
+            )
+            if expected > len(data):
+                SdkLog.e(_TAG, f"Invalid dataLength:{len(data)} for data type {_type_name()}")
+                return ReadSamplesResult.Error
+
         try:
             packageIndex = 0
             maxPackageIndex = 0
@@ -1492,28 +1526,6 @@ class SensorProfileDataCtx:
         if lostSampleCount <= 0:
             if data is None or offset < 0 or offset > len(data):
                 raise ValueError(f"Invalid data or offset for data type {_type_name()}")
-
-            if sensorData.resolutionBits in (7, 8):
-                bytesPerChannel = 1
-            elif sensorData.resolutionBits in (12, 16, 17, 0):
-                bytesPerChannel = 2
-            elif sensorData.resolutionBits == 24:
-                bytesPerChannel = 3
-            elif sensorData.resolutionBits in (31, 32, 33):
-                bytesPerChannel = 4
-            else:
-                bytesPerChannel = 2
-
-            dataLength = len(data)
-
-            realChannelCount = 0
-            for channelIndex, impedanceChannelIndex in enumerate(range(sensorData.channelCount)):
-                if (sensorData.channelMask & (1 << channelIndex)) != 0:
-                    realChannelCount += 1
-
-            if offset + ((bytesPerChannel  * realChannelCount * sampleCount) + (dataGap * (sampleCount - 1)))  > dataLength:
-                raise ValueError(f"Invalid dataLength:{dataLength} for data type {_type_name()}")
-        
 
         sampleInterval = (
             int(1000.0 / sensorData.sampleRate) if sensorData.sampleRate > 0 else 0

@@ -839,14 +839,17 @@ class BleakProcess(multiprocessing.Process):
 
     async def _battery_loop(self, device_mac: str):
 
-        interval = self._power_intervals.get(device_mac, 0)
-        while interval > 0 and device_mac in self._gforces:
+        while True:
+            interval = self._power_intervals.get(device_mac, 0)
+            if interval <= 0 or device_mac not in self._gforces:
+                break
             await asyncio.sleep(interval / 1000)
             try:
                 power = await self._gforces[device_mac].get_battery_level()
                 self._publish("power_changed", device_mac=device_mac, power=power)
             except Exception:
-                break
+                # 单次刷新失败不中断循环，否则一次超时/丢包后就再也无法刷新电量
+                SdkLog.exception(_TAG, f"Battery refresh failed: {device_mac}")
 
     async def _device_data_loop(self, device_mac: str):
 

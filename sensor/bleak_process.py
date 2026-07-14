@@ -72,11 +72,13 @@ class BleakProcess(multiprocessing.Process):
         self,
         cmd_queue: multiprocessing.Queue,
         result_queue: multiprocessing.Queue,
+        data_queue: multiprocessing.Queue,
         log_path: str = None,
     ):
         super().__init__(daemon=True)
         self.cmd_queue = cmd_queue
         self.result_queue = result_queue
+        self.data_queue = data_queue
         self._log_path = log_path
         self._scanner = None
         self._is_scanning = False
@@ -141,15 +143,23 @@ class BleakProcess(multiprocessing.Process):
 
     def _flush_msg_queue(self):
 
+        def _route_and_put(msg):
+            msg_type = msg.get("type")
+            if msg_type == "sensor_data":
+                try:
+                    self.data_queue.put_nowait(msg)
+                except queue.Full:
+                    pass
+            elif msg_type in self._DROPABLE_MSG_TYPES:
+                self.result_queue.put_nowait(msg)
+            else:
+                # Use a short timeout during shutdown so the child process can exit cleanly.
+                self.result_queue.put(msg, timeout=2.0)
+
         while True:
             try:
                 msg = self._msg_queue.get_nowait()
-                msg_type = msg.get("type")
-                if msg_type in self._DROPABLE_MSG_TYPES:
-                    self.result_queue.put_nowait(msg)
-                else:
-                    # Use a short timeout during shutdown so the child process can exit cleanly.
-                    self.result_queue.put(msg, timeout=2.0)
+                _route_and_put(msg)
             except queue.Empty:
                 break
             except queue.Full:
@@ -170,6 +180,7 @@ class BleakProcess(multiprocessing.Process):
     async def _publisher_task(self):
         # Throttle queue-full logs to avoid blocking stdout on Windows.
         _last_queue_full_log = 0.0
+        _last_data_queue_full_log = 0.0
 
         while True:
             msg = None
@@ -177,7 +188,17 @@ class BleakProcess(multiprocessing.Process):
             try:
                 msg = self._msg_queue.get_nowait()
                 msg_type = msg.get("type")
-                if msg_type in self._DROPABLE_MSG_TYPES:
+                if msg_type == "sensor_data":
+                    # High-frequency data: use a dedicated drop-capable queue so it cannot
+                    # block control/result messages in the main result queue.
+                    try:
+                        self.data_queue.put_nowait(msg)
+                    except queue.Full:
+                        now = time.time()
+                        if now - _last_data_queue_full_log >= 2.0:
+                            _last_data_queue_full_log = now
+                            SdkLog.w(_TAG, "Data queue is full, dropping sensor_data")
+                elif msg_type in self._DROPABLE_MSG_TYPES:
                     self.result_queue.put_nowait(msg)
                 else:
                     # Use a short timeout for important messages so the publisher does not stall.
@@ -845,9 +866,9 @@ class BleakProcess(multiprocessing.Process):
 
         try:
             if ctx.isUniversalStream:
-                await ctx.processUniversalData(local_buf, on_data, on_error)
+                await ctx._processUniversalData(local_buf, on_data, on_error)
             else:
-                await ctx.process_data(local_buf, on_data, on_error)
+                await ctx._process_data(local_buf, on_data, on_error)
         except asyncio.CancelledError as e:
             SdkLog.exception(_TAG, "Data loop cancelled")
         except Exception as e:

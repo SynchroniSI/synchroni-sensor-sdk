@@ -9,8 +9,11 @@
     SdkLog.set_log_path("")                  # 禁用文件日志
 """
 
+import atexit
 import logging
+import logging.handlers
 import os
+import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -41,6 +44,16 @@ class SdkLog:
     _controller_logger = logging.getLogger("sensor_sdk_controller")
     _controller_logger.setLevel(logging.DEBUG)
     _controller_handler: Optional[logging.FileHandler] = None
+
+    # 异步日志队列与监听器，避免写文件阻塞业务线程
+    _LOG_QUEUE_MAXSIZE = 10000
+    _log_queue = queue.Queue(maxsize=_LOG_QUEUE_MAXSIZE)
+    _log_listener: Optional[logging.handlers.QueueListener] = None
+    _log_queue_handler: Optional[logging.handlers.QueueHandler] = None
+
+    _controller_log_queue = queue.Queue(maxsize=_LOG_QUEUE_MAXSIZE)
+    _controller_log_listener: Optional[logging.handlers.QueueListener] = None
+    _controller_log_queue_handler: Optional[logging.handlers.QueueHandler] = None
 
     @classmethod
     def _formatter(cls) -> logging.Formatter:
@@ -88,11 +101,41 @@ class SdkLog:
     def _remove_file_handler(cls):
         if cls._file_handler is not None:
             try:
-                cls._logger.removeHandler(cls._file_handler)
                 cls._file_handler.close()
             except Exception:
                 pass
             cls._file_handler = None
+
+    @classmethod
+    def _start_log_listener(cls):
+        """启动主日志监听器，让文件写操作在独立线程执行。"""
+        if cls._file_handler is None:
+            return
+        if cls._log_listener is not None:
+            return
+        cls._log_listener = logging.handlers.QueueListener(
+            cls._log_queue, cls._file_handler, respect_handler_level=True
+        )
+        cls._log_listener.start()
+        if cls._log_queue_handler is None:
+            cls._log_queue_handler = logging.handlers.QueueHandler(cls._log_queue)
+            cls._logger.addHandler(cls._log_queue_handler)
+
+    @classmethod
+    def _stop_log_listener(cls):
+        """停止主日志监听器并移除队列处理器。"""
+        if cls._log_listener is not None:
+            try:
+                cls._log_listener.stop()
+            except Exception:
+                pass
+            cls._log_listener = None
+        if cls._log_queue_handler is not None:
+            try:
+                cls._logger.removeHandler(cls._log_queue_handler)
+            except Exception:
+                pass
+            cls._log_queue_handler = None
 
     @classmethod
     def set_debug_enabled(cls, enabled: bool):
@@ -125,6 +168,7 @@ class SdkLog:
                 - ``""``：禁用文件日志。
                 - 其他：使用指定路径。
         """
+        cls._stop_log_listener()
         cls._remove_file_handler()
         if path == "":
             cls._log_path = None
@@ -138,8 +182,8 @@ class SdkLog:
         try:
             handler = logging.FileHandler(path, encoding="utf-8")
             handler.setFormatter(cls._formatter())
-            cls._logger.addHandler(handler)
             cls._file_handler = handler
+            cls._start_log_listener()
         except Exception as e:
             cls._logger.warning(f"Failed to create log file {path}: {e}")
 
@@ -172,6 +216,37 @@ class SdkLog:
         return str(docs / "sensorsdklog" / f"sensor_controller_log_{timestamp}.txt")
 
     @classmethod
+    def _start_controller_log_listener(cls):
+        """启动 Controller 日志监听器。"""
+        if cls._controller_handler is None:
+            return
+        if cls._controller_log_listener is not None:
+            return
+        cls._controller_log_listener = logging.handlers.QueueListener(
+            cls._controller_log_queue, cls._controller_handler, respect_handler_level=True
+        )
+        cls._controller_log_listener.start()
+        if cls._controller_log_queue_handler is None:
+            cls._controller_log_queue_handler = logging.handlers.QueueHandler(cls._controller_log_queue)
+            cls._controller_logger.addHandler(cls._controller_log_queue_handler)
+
+    @classmethod
+    def _stop_controller_log_listener(cls):
+        """停止 Controller 日志监听器。"""
+        if cls._controller_log_listener is not None:
+            try:
+                cls._controller_log_listener.stop()
+            except Exception:
+                pass
+            cls._controller_log_listener = None
+        if cls._controller_log_queue_handler is not None:
+            try:
+                cls._controller_logger.removeHandler(cls._controller_log_queue_handler)
+            except Exception:
+                pass
+            cls._controller_log_queue_handler = None
+
+    @classmethod
     def set_controller_log_path(cls, path: Optional[str] = None):
         """设置 SensorController 专用日志文件路径。
 
@@ -181,9 +256,9 @@ class SdkLog:
                 - ``""``：禁用 Controller 日志。
                 - 其他：使用指定路径。
         """
+        cls._stop_controller_log_listener()
         if cls._controller_handler is not None:
             try:
-                cls._controller_logger.removeHandler(cls._controller_handler)
                 cls._controller_handler.close()
             except Exception:
                 pass
@@ -199,10 +274,10 @@ class SdkLog:
         try:
             handler = logging.FileHandler(path, encoding="utf-8")
             handler.setFormatter(cls._controller_formatter())
-            cls._controller_logger.addHandler(handler)
             cls._controller_handler = handler
+            cls._start_controller_log_listener()
         except Exception as e:
-            cls._logger.warning(f"Failed to create controller log file {path}: {e}")
+            cls._controller_logger.warning(f"Failed to create controller log file {path}: {e}")
 
     @classmethod
     def get_controller_log_path(cls) -> Optional[str]:
@@ -217,6 +292,15 @@ class SdkLog:
                 cls.set_controller_log_path()
         else:
             cls.set_controller_log_path("")
+
+    @classmethod
+    def stop(cls):
+        """停止所有异步日志监听器，确保日志 flush 到文件。
+
+        程序退出时建议调用一次，避免队列中的日志丢失。
+        """
+        cls._stop_log_listener()
+        cls._stop_controller_log_listener()
 
     @classmethod
     def controller(cls, tag: str, msg: str):
@@ -257,3 +341,7 @@ class SdkLog:
     def exception(cls, tag: str, msg: str = ""):
         """输出 exception 日志，包含当前异常堆栈。"""
         cls._logger.exception(f"[{tag}] {msg}")
+
+
+# 程序正常退出时自动停止日志监听器，尽量保证队列中的日志落盘
+atexit.register(SdkLog.stop)

@@ -17,7 +17,8 @@ class BleakHost:
     def __init__(self):
         self._cmd_queue = multiprocessing.Queue(maxsize=50)
         self._result_queue = multiprocessing.Queue(maxsize=sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE)
-        self._bleak_process = BleakProcess(self._cmd_queue, self._result_queue, SdkLog.get_log_path())
+        self._data_queue = multiprocessing.Queue(maxsize=sensor_utils.BLEAK_DATA_QUEUE_MAXSIZE)
+        self._bleak_process = BleakProcess(self._cmd_queue, self._result_queue, self._data_queue, SdkLog.get_log_path())
         self._started = False
 
 
@@ -69,6 +70,7 @@ class BleakHost:
         try:
             self._cmd_queue.close()
             self._result_queue.close()
+            self._data_queue.close()
         except Exception as e:
             SdkLog.exception(_TAG, "Error closing queues")
 
@@ -125,38 +127,68 @@ class BleakHost:
 
     async def _consume_results(self):
 
+        def _try_get(q, timeout):
+            try:
+                return q.get(True, timeout)
+            except queue.Empty:
+                return None
+
         while not getattr(self, '_should_exit', False):
             try:
+                # Prioritize control/result messages; data messages are drained in batch below.
                 msg = await asyncio.get_event_loop().run_in_executor(
-                    None, self._result_queue.get, True, 0.1
+                    None, _try_get, self._result_queue, 0.02
                 )
-            except queue.Empty:
-                continue
             except Exception:
+                msg = None
+
+            if msg is None:
+                try:
+                    msg = await asyncio.get_event_loop().run_in_executor(
+                        None, _try_get, self._data_queue, 0.02
+                    )
+                except Exception:
+                    msg = None
+
+            if msg is None:
+                await asyncio.sleep(0.001)
                 continue
 
-            msg_type = msg.get("type")
-            if msg_type == "scan_once_result":
-                if self.on_scan_once_result is not None:
+            self._dispatch_message(msg)
+
+            # Batch drain both queues to catch up quickly and reduce per-get overhead.
+            for q in (self._result_queue, self._data_queue):
+                while True:
                     try:
-                        self.on_scan_once_result(msg)
-                    except Exception as e:
-                        SdkLog.exception(_TAG, "Unexpected error")
-            elif msg_type == "devices":
-                if self.on_scan_result is not None:
-                    try:
-                        self.on_scan_result(msg)
-                    except Exception as e:
-                        SdkLog.exception(_TAG, "Unexpected error")
-            elif msg_type == "command_result":
-                self._handle_command_result(msg)
-            elif msg_type in ("state_changed", "power_changed", "sensor_data", "error"):
-                if self.on_device_message is not None:
-                    device_mac = msg.get("device_mac")
-                    try:
-                        self.on_device_message(device_mac, msg)
-                    except Exception as e:
-                        SdkLog.exception(_TAG, "Unexpected error")
+                        self._dispatch_message(q.get_nowait())
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+
+    def _dispatch_message(self, msg):
+        msg_type = msg.get("type")
+        if msg_type == "scan_once_result":
+            if self.on_scan_once_result is not None:
+                try:
+                    self.on_scan_once_result(msg)
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
+        elif msg_type == "devices":
+            if self.on_scan_result is not None:
+                try:
+                    self.on_scan_result(msg)
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
+        elif msg_type == "command_result":
+            self._handle_command_result(msg)
+        elif msg_type in ("state_changed", "power_changed", "sensor_data", "error"):
+            if self.on_device_message is not None:
+                device_mac = msg.get("device_mac")
+                try:
+                    self.on_device_message(device_mac, msg)
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
     def _handle_command_result(self, msg):
 

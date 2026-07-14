@@ -8,7 +8,7 @@ with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f
 
 setup(
     name="synchroni-sensor-sdk",
-    version="1.1.2",
+    version="1.1.5",
     description="Python sdk for Synchroni",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -16,7 +16,7 @@ setup(
     author="Martin Ye",
     author_email="yecq_82@hotmail.com",
     packages=find_packages(),
-    install_requires=["numpy", "setuptools", "bleak>=3.0.2"],
+    install_requires=["numpy", "setuptools", "bleak>=3.0.2", "flatbuffers>=25.0.0"],
     package_data={"sensor": []},
     zip_safe=True,
     python_requires=">=3.10.0",

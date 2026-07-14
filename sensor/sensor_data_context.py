@@ -3,8 +3,12 @@ from collections import deque
 from datetime import datetime
 import os
 import platform
+import queue
+from queue import Queue, Full, Empty
 import struct
 import math
+import threading
+import time
 from typing import Deque, List
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, IntEnum
@@ -13,6 +17,7 @@ from queue import Queue
 from sensor import sensor_utils
 from sensor.gforce import DataSubscription, GForce, ImuRawDataConfig, SamplingRate
 from sensor.sensor_data import DataType, Sample, SensorData
+from sensor.sensor_data_pool import SensorDataPool
 
 from enum import Enum, IntEnum
 
@@ -22,6 +27,11 @@ from sensor.sdk_log import SdkLog
 _TAG = "SensorProfileDataCtx"
 
 QUAT_SCALE = 1 / 1073741824.0  # 2^30
+
+# 拼接缓冲区最大长度，防止 corrupted/不同步数据无限增长
+_MAX_CONCAT_BUFFER_SIZE = 64 * 1024  # 64KB
+# data 日志队列最大长度，写盘跟不上时丢弃日志而不是阻塞解析线程
+_DATA_LOG_QUEUE_MAXSIZE = 1000
 
 class SensorDataType(IntEnum):
     DATA_TYPE_EEG = 0
@@ -67,6 +77,13 @@ class PPGDataMode(IntEnum):
     PPG_AND_SPO2 = 2
 
 
+class ReadSamplesResult(IntEnum):
+    """checkReadSamples 的返回值，与 C++ 三态枚举保持一致"""
+    OK = 0
+    Repeated = 1
+    Error = 2
+
+
 class SensorProfileDataCtx:
     def __init__(self, gForce: GForce, deviceMac: str, buf: Queue[bytes]) -> None:
         self.featureMap: int = 0
@@ -83,6 +100,14 @@ class SensorProfileDataCtx:
         self.isUniversalStream: bool = gForce._is_universal_stream
         self._rawDataBuffer: Queue[bytes] = buf
         self._concatDataBuffer = bytearray()
+
+        # 对象池：静态预分配 SensorData / Sample / FlatBuffers 输出槽
+        self._object_pool = SensorDataPool(
+            sensor_data_slots=32,
+            samples_per_slot=1024,
+            flatbuffer_slots=32,
+            flatbuffer_size=8192,
+        )
         # EMG support
         self.isNewEMG = False
         # Quaternion support
@@ -113,11 +138,40 @@ class SensorProfileDataCtx:
         self._data_log_path = None
         self._data_log_file = None
         self._data_log_writer = None
+        self._data_log_queue = Queue(maxsize=_DATA_LOG_QUEUE_MAXSIZE)
+        self._data_log_thread = None
+        self._data_log_stop_event = threading.Event()
+
+        # 守护线程：监控解析线程是否卡住，防止内存无限增长
+        self._last_progress_time = time.time()
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name=f"DataWatchdog-{self.deviceMac}",
+        )
+        self._watchdog_thread.daemon = True
+        self._watchdog_thread.start()
 
     def close(self):
         self._is_running = False
         if self.debugCSVWriter is not None:
             self.debugCSVWriter = None
+        self._stop_data_log_thread()
+        self._stop_watchdog_thread()
+
+    def _stop_data_log_thread(self):
+        """停止 data 日志写入线程并等待其退出。"""
+        if self._data_log_thread is not None and self._data_log_thread.is_alive():
+            self._data_log_stop_event.set()
+            try:
+                self._data_log_queue.put_nowait(None)
+            except Full:
+                pass
+            try:
+                self._data_log_thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self._data_log_thread = None
         if self._data_log_file is not None:
             try:
                 self._data_log_file.close()
@@ -126,7 +180,61 @@ class SensorProfileDataCtx:
             self._data_log_file = None
         self._data_log_writer = None
 
-    def clear(self) -> None:
+    def _stop_watchdog_thread(self):
+        """停止数据解析看门狗线程。"""
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            self._watchdog_stop_event.set()
+            try:
+                self._watchdog_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self._watchdog_thread = None
+
+    def _watchdog_loop(self):
+        """守护线程：监控解析线程进度，防止卡死后内存无限增长。"""
+        WATCHDOG_INTERVAL = 1.0  # 检查间隔
+        WATCHDOG_TIMEOUT = 5.0   # 无进度报警阈值
+        RAW_BUF_CLEAR_THRESHOLD = 1500  # 超过此值且无进度时清空
+
+        while not self._watchdog_stop_event.is_set():
+            self._watchdog_stop_event.wait(WATCHDOG_INTERVAL)
+            if self._watchdog_stop_event.is_set():
+                break
+
+            if not self._is_running:
+                continue
+
+            try:
+                raw_qsize = self._rawDataBuffer.qsize()
+                concat_len = len(self._concatDataBuffer)
+                elapsed = time.time() - self._last_progress_time
+
+                # 只在数据传输期间且队列有数据时判断
+                if not self.isDataTransfering or raw_qsize == 0:
+                    continue
+
+                if elapsed > WATCHDOG_TIMEOUT:
+                    SdkLog.w(
+                        _TAG,
+                        f"Data parsing appears stalled: no progress for {elapsed:.1f}s, "
+                        f"raw_buf={raw_qsize}, concat_buf={concat_len}"
+                    )
+                    # 如果 raw buffer 已经积压到危险水位，直接清空防止内存爆炸
+                    if raw_qsize > RAW_BUF_CLEAR_THRESHOLD:
+                        SdkLog.w(_TAG, f"Raw buffer too large ({raw_qsize}), clearing to protect memory")
+                        try:
+                            while not self._rawDataBuffer.empty():
+                                self._rawDataBuffer.get_nowait()
+                                self._rawDataBuffer.task_done()
+                        except Exception:
+                            pass
+                        self._concatDataBuffer.clear()
+                        # 清空后更新时间戳，避免持续报警
+                        self._last_progress_time = time.time()
+            except Exception as e:
+                SdkLog.exception(_TAG, f"Watchdog error: {e}")
+
+    def clear(self):
         for sensorData in self.sensorDatas:
             sensorData.clear()
         self.impedanceData.clear()
@@ -316,7 +424,7 @@ class SensorProfileDataCtx:
         data = SensorData()
         data.deviceMac = self.deviceMac
         data.dataType = DataType.NTF_GEST
-        data.sampleRate = emgSampleRate / 32
+        data.sampleRate = emgSampleRate / 32.0
         data.resolutionBits = 0
         data.resolutionSigned = 0
         data.channelCount = 1
@@ -441,7 +549,7 @@ class SensorProfileDataCtx:
     async def initIMU(self, packageCount: int) -> int:
         SdkLog.d(_TAG, "initIMU(...)")
         IMU_TYPE_QAT6 = 0x0004
-        min_package_sample_count = 1
+        min_package_sample_count = 2
         self.isContainQAT6 = False
 
         if not self.hasIMU():
@@ -457,7 +565,7 @@ class SensorProfileDataCtx:
             cfg = ImuRawDataConfig()
             cfg.channel_count = channel_mask
             cfg.fs = samp_rate
-            cfg.batch_len = 1
+            cfg.batch_len = min_package_sample_count
             await self.gForce.set_imu_raw_data_config(cfg)
 
         config = await self.gForce.get_imu_raw_data_config()
@@ -836,13 +944,10 @@ class SensorProfileDataCtx:
 
     async def setDebugCSV(self, debugFilePath) -> str:
         """设置/关闭 per-profile 的 data 日志 CSV 文件。"""
-        if self._data_log_file is not None:
-            try:
-                self._data_log_file.close()
-            except Exception:
-                pass
-            self._data_log_file = None
-        self._data_log_writer = None
+        # 先停止已有的日志线程
+        self._stop_data_log_thread()
+        self._data_log_queue = Queue(maxsize=_DATA_LOG_QUEUE_MAXSIZE)
+        self._data_log_stop_event.clear()
 
         if debugFilePath == "False" or debugFilePath is None or debugFilePath == "":
             self._data_log_enabled = False
@@ -856,18 +961,49 @@ class SensorProfileDataCtx:
         self._data_log_enabled = True
         try:
             self._ensure_dir(os.path.dirname(self._data_log_path))
-            self._data_log_file = open(self._data_log_path, "w", newline="", encoding="utf-8")
-            self._data_log_writer = csv.writer(self._data_log_file, delimiter=",")
-            self._data_log_writer.writerow([
-                "timestamp", "mac", "type", "raw_hex", "data_type",
-                "sample_rate", "channel_count", "lost_count", "samples_info", "first_sample",
-            ])
-            self._data_log_file.flush()
+            self._data_log_thread = threading.Thread(
+                target=self._data_log_worker,
+                args=(self._data_log_path,),
+                name=f"DataLog-{self.deviceMac}",
+            )
+            self._data_log_thread.daemon = True
+            self._data_log_thread.start()
             return "OK"
         except Exception as e:
             self._data_log_enabled = False
             SdkLog.exception(_TAG, f"setDebugCSV failed: {self._data_log_path} {e}")
             return "ERROR: " + str(e)
+
+    def _data_log_worker(self, path: str):
+        """在独立线程中写 data 日志 CSV。"""
+        try:
+            self._ensure_dir(os.path.dirname(path))
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=",")
+                writer.writerow([
+                    "timestamp", "mac", "type", "raw_hex", "data_type",
+                    "sample_rate", "channel_count", "lost_count", "samples_info", "first_sample",
+                ])
+                f.flush()
+                while not self._data_log_stop_event.is_set():
+                    try:
+                        row = self._data_log_queue.get(timeout=0.1)
+                        if row is None:
+                            break
+                        writer.writerow(row)
+                    except Empty:
+                        continue
+                # 退出前把队列里剩余的日志写完
+                while True:
+                    try:
+                        row = self._data_log_queue.get_nowait()
+                        if row is not None:
+                            writer.writerow(row)
+                    except Empty:
+                        break
+                f.flush()
+        except Exception as e:
+            SdkLog.exception(_TAG, f"Data log worker failed: {path} {e}")
 
     def _ensure_dir(self, path: str):
         if path:
@@ -877,24 +1013,23 @@ class SensorProfileDataCtx:
                 pass
 
     def _write_data_log_raw(self, data: bytes):
-        """将收到的原始蓝牙数据包写入 data 日志 CSV。"""
-        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled or self._data_log_writer is None:
+        """将收到的原始蓝牙数据包写入 data 日志队列，由独立线程写 CSV。"""
+        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled:
             return
         try:
-            self._data_log_writer.writerow([
+            self._data_log_queue.put_nowait([
                 datetime.now().isoformat(),
                 self.deviceMac,
                 "raw",
                 data.hex(),
                 "", "", "", "", "",
             ])
-            self._data_log_file.flush()
-        except Exception as e:
-            SdkLog.e(_TAG, f"Failed to write raw data log: {e}")
+        except Full:
+            SdkLog.w(_TAG, "Data log queue full, dropping raw log entry")
 
     def _write_data_log_parsed(self, sensorData: SensorData):
-        """将解析后的 SensorData 写入 data 日志 CSV。"""
-        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled or self._data_log_writer is None:
+        """将解析后的 SensorData 写入 data 日志队列，由独立线程写 CSV。"""
+        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled:
             return
         try:
             sample_counts = [len(ch) for ch in sensorData.channelSamples]
@@ -912,7 +1047,7 @@ class SensorProfileDataCtx:
                     f"ch={first_sample.channelIndex}|lost={first_sample.isLost}"
                 )
             type_name = sensorData.dataType.name if hasattr(sensorData.dataType, "name") else sensorData.dataType
-            self._data_log_writer.writerow([
+            self._data_log_queue.put_nowait([
                 datetime.now().isoformat(),
                 sensorData.deviceMac or self.deviceMac,
                 "parsed",
@@ -924,20 +1059,21 @@ class SensorProfileDataCtx:
                 str(sample_counts),
                 first_sample_str,
             ])
-            self._data_log_file.flush()
-        except Exception as e:
-            SdkLog.e(_TAG, f"Failed to write parsed data log: {e}")
+        except Full:
+            SdkLog.w(_TAG, "Data log queue full, dropping parsed log entry")
 
     ####################################################################################
 
-    async def process_data(self, buf: Queue[SensorData], on_data_callback, on_error_callback=None):
+    async def _process_data(self, buf: Queue[bytes], on_data_callback, on_error_callback=None):
         while self._is_running:
             while self._is_running and self._rawDataBuffer.empty():
                 if self._is_running and self.isDataTransfering and not buf.empty():
                     sensorData: SensorData = None
                     try:
-                        sensorData = buf.get_nowait()
-                    except Exception:
+                        fb_bytes = buf.get_nowait()
+                        sensorData = self._object_pool.acquire_sensor_data()
+                        sensorData = SensorData.from_flatbuffers_pooled(fb_bytes, sensorData, self._object_pool)
+                    except Exception as e:
                         break
                     if not sensor_utils._terminated and sensorData != None and on_data_callback != None:
                         try:
@@ -957,11 +1093,15 @@ class SensorProfileDataCtx:
                     self._write_data_log_raw(data)
 
                     if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
+                        if len(self._concatDataBuffer) > _MAX_CONCAT_BUFFER_SIZE:
+                            SdkLog.w(_TAG, f"Concat buffer exceeded {_MAX_CONCAT_BUFFER_SIZE}, clearing")
+                            self._concatDataBuffer.clear()
                         self._concatDataBuffer.extend(data)
                     else:
                         self._processDataPackage(data, buf, on_error_callback)
 
                     self._rawDataBuffer.task_done()
+                    self._last_progress_time = time.time()
             except Exception as e:
                 SdkLog.exception(_TAG, "Unexpected error")
 
@@ -989,8 +1129,8 @@ class SensorProfileDataCtx:
                             continue
                         if self._is_data_transfering:
                             data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                            self._processDataPackage(data_package, buf, on_error_callback)
-                        last_cut = index = index + 2 + n
+                            if self._processDataPackage(data_package, buf, on_error_callback):
+                                last_cut = index = index + 2 + n
                         index += 1
                     else:
                         index += 1
@@ -1000,77 +1140,69 @@ class SensorProfileDataCtx:
                     last_cut = -1
                     index = 0
 
-    def _processDataPackage(self, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+    def _processDataPackage(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
+        if not data:
+            return False
         v = data[0] & 0x7F
-        if v == DataType.NTF_IMPEDANCE:
-            self._process_impedance_samples(v, data, buf, on_error_callback)
-        elif v == DataType.NTF_IMPEDANCE_EXT:
-            self._process_impedance_samples(v, data, buf, on_error_callback)
+
+        def dispatch(sensor_data_type: SensorDataType, data_offset: int, data_gap: int) -> bool:
+            sensor_data = self.sensorDatas[sensor_data_type]
+            res = self.checkReadSamples(data, sensor_data, data_offset, data_gap, on_error_callback)
+            if res == ReadSamplesResult.Error:
+                return False
+            if res == ReadSamplesResult.OK:
+                self.sendSensorData(sensor_data, buf)
+            return True
+
+        if v == DataType.NTF_IMPEDANCE or v == DataType.NTF_IMPEDANCE_EXT:
+            return self._process_impedance_samples(v, data, buf, on_error_callback)
         elif v == DataType.NTF_MAG_ANGLE_DATA:
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE]
-            if self.checkReadSamples(data, sensor_data, 4, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_MAG_ANGLE, 4, 0)
         elif v == DataType.NTF_EMG:
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
-            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_EMG, self.sensorDatas[SensorDataType.DATA_TYPE_EMG].packageIndexLength + 1, 0)
         elif v == DataType.NTF_GEST:
-            self._process_gesture_samples(v, data, buf, on_error_callback)
+            return self._process_gesture_samples(v, data, buf, on_error_callback)
         elif v == DataType.NTF_EEG:
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
-            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_EEG, 3, 0)
         elif v == DataType.NTF_ECG:
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_ECG]
-            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_ECG, 3, 0)
         elif v == DataType.NTF_BRTH:
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH]
-            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_BRTH, 3, 0)
         elif v == DataType.NTF_IMU and self.hasIMU():
-            self._process_imu_samples(data, buf, on_error_callback)
+            return self._process_imu_samples(data, buf, on_error_callback)
         elif v == DataType.NTF_PPG and self.hasPPG() and self.notify_map.get("NTF_PPG") == "ON":
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_PPG]
-            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_PPG, 3, 0)
         elif v == DataType.NTF_SPO2 and self.hasPPG() and self.notify_map.get("NTF_SPO2") == "ON":
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2]
-            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_SPO2, 3, 0)
         elif v == DataType.NTF_EULER_DATA and self.hasEuler():
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EULER]
-            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_EULER, self.sensorDatas[SensorDataType.DATA_TYPE_EULER].packageIndexLength + 1, 0)
         elif v == DataType.NTF_QUATERNION and self.hasQuat():
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT]
-            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_GFORCE_QUAT, self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT].packageIndexLength + 1, 0)
         elif v == DataType.NTF_ACC and self.hasAcc():
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
-            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_ACC, self.sensorDatas[SensorDataType.DATA_TYPE_ACC].packageIndexLength + 1, 0)
         elif v == DataType.NTF_GYRO and self.hasGyro():
-            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
-            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
-                self.sendSensorData(sensor_data, buf)
+            return dispatch(SensorDataType.DATA_TYPE_GYRO, self.sensorDatas[SensorDataType.DATA_TYPE_GYRO].packageIndexLength + 1, 0)
         else:
-            SdkLog.w(_TAG, f"Unknown data type received: {v}")
-            
-    def _process_gesture_samples(self, type, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+            # Unknown data type is treated as a parse error; do not spam warnings.
+            return False
+
+    def _process_gesture_samples(self, type, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         if (len(data) < 7):
             if on_error_callback:
                 on_error_callback("Incomplete Gesture packet received")
-            return
+            return False
         
         sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GEST]
+        if sensor_data is None or sensor_data.sampleRate <= 0:
+            return True
+
         self.checkReadSamples(data, sensor_data, 0, -1)
-        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
+        sampleInterval = 1000.0 / sensor_data.sampleRate
         lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
         sensor_data.channelSamples = []
 
         samples = []
-        sample = Sample()
+        sample = self._object_pool.acquire_sample()
         
         offset = sensor_data.packageIndexLength + 1
         sample.data = data[offset]
@@ -1091,14 +1223,15 @@ class SensorProfileDataCtx:
             sample.saturation = 100
             
         sample.sampleIndex = lastSampleIndex
-        sample.timeStampInMs = lastSampleIndex * sampleInterval
+        sample.timeStampInMs = int(lastSampleIndex * sampleInterval)
         sample.channelIndex = 0
         samples.append(sample)
         sensor_data.channelSamples.append(samples)
         
         self.sendSensorData(sensor_data, buf)
+        return True
 
-    def _process_impedance_samples(self, type, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+    def _process_impedance_samples(self, type, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         offset = 3
 
         impedanceData = []
@@ -1113,7 +1246,7 @@ class SensorProfileDataCtx:
         if (len(data) < (offset + bytesPerChannel * channelCount)):
             if on_error_callback:
                 on_error_callback("Incomplete Impedance packet received")
-            return
+            return False
         
         for index in range(channelCount):
             impedance = struct.unpack_from("<f", data, offset)[0]
@@ -1140,18 +1273,19 @@ class SensorProfileDataCtx:
         sensor_data.channelSamples = []
         for index in range(channelCount):
             samples = []
-            sample = Sample()
-            sample.rawData = saturationData[index]
+            sample = self._object_pool.acquire_sample()
+            sample.rawData = int(saturationData[index])
             sample.data = impedanceData[index]
             sample.impedance = impedanceData[index]
             sample.saturation = saturationData[index]
             sample.sampleIndex = lastSampleIndex
-            sample.timeStampInMs = lastSampleIndex * sampleInterval
+            sample.timeStampInMs = int(lastSampleIndex * sampleInterval)
             sample.channelIndex = index
             samples.append(sample)
             sensor_data.channelSamples.append(samples)
         
         self.sendSensorData(sensor_data, buf)
+        return True
 
     def _has_complete_imu_packet(
             self,
@@ -1166,7 +1300,7 @@ class SensorProfileDataCtx:
 
         return len(data) >= dataOffset + sensor_data_ref.packageSampleCount * frameSize
     
-    def _process_imu_samples(self, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+    def _process_imu_samples(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
         sensor_data_gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
         sensor_data_quat = None
@@ -1179,25 +1313,35 @@ class SensorProfileDataCtx:
         if not self._has_complete_imu_packet(data, sensor_data_acc, sensor_data_quat, 3):
             if on_error_callback:
                 on_error_callback("Incomplete IMU packet received")
-            return
+            return False
 
+        def _dispatch_imu(sensor_data, data_offset, data_gap):
+            res = self.checkReadSamples(data, sensor_data, data_offset, data_gap, on_error_callback)
+            if res == ReadSamplesResult.Error:
+                return False
+            if res == ReadSamplesResult.OK:
+                self.sendSensorData(sensor_data, buf)
+            return True
+
+        ok = True
         if not self.isContainQAT6:
-            if self.checkReadSamples(data, sensor_data_acc, 3, 6, on_error_callback):
-                self.sendSensorData(sensor_data_acc, buf)
-
-            if self.checkReadSamples(data, sensor_data_gyro, 9, 6, on_error_callback):
-                self.sendSensorData(sensor_data_gyro, buf)
+            if not _dispatch_imu(sensor_data_acc, 3, 6):
+                ok = False
+            if not _dispatch_imu(sensor_data_gyro, 9, 6):
+                ok = False
         else:
-            if self.checkReadSamples(data, sensor_data_acc, 3, 18, on_error_callback):
-                self.sendSensorData(sensor_data_acc, buf)
-
-            if self.checkReadSamples(data, sensor_data_gyro, 9, 18, on_error_callback):
-                self.sendSensorData(sensor_data_gyro, buf)
+            if not _dispatch_imu(sensor_data_acc, 3, 18):
+                ok = False
+            if not _dispatch_imu(sensor_data_gyro, 9, 18):
+                ok = False
 
             if sensor_data_euler.channelSamples is None or len(sensor_data_euler.channelSamples) == 0:
                 sensor_data_euler.channelSamples = [[], [], []]
         
-            if self.checkReadSamples(data, sensor_data_quat, 15, 12, on_error_callback):
+            res_quat = self.checkReadSamples(data, sensor_data_quat, 15, 12, on_error_callback)
+            if res_quat == ReadSamplesResult.Error:
+                ok = False
+            elif res_quat == ReadSamplesResult.OK:
                 #add w
                 sampleCount = sensor_data_quat.packageSampleCount
                 for sampleIndex in range(sampleCount):
@@ -1209,7 +1353,7 @@ class SensorProfileDataCtx:
                         y = y_sample.data
                         z = z_sample.data
                         w = math.sqrt(max(0.0, 1.0 - x ** 2 - y ** 2 - z ** 2))
-                        dataItem = Sample()
+                        dataItem = self._object_pool.acquire_sample()
                         dataItem.channelIndex = 0
                         dataItem.sampleIndex = x_sample.sampleIndex
                         dataItem.timeStampInMs = x_sample.timeStampInMs
@@ -1220,7 +1364,7 @@ class SensorProfileDataCtx:
 
                         #add euler
                         R = math.atan2(2 * (w * x + y * z), 1 - 2 * (x ** 2 + y ** 2)) * 180 / math.pi
-                        R_sample = Sample()
+                        R_sample = self._object_pool.acquire_sample()
                         R_sample.channelIndex = 0
                         R_sample.sampleIndex = x_sample.sampleIndex
                         R_sample.timeStampInMs = x_sample.timeStampInMs
@@ -1229,7 +1373,7 @@ class SensorProfileDataCtx:
                         R_sample.isLost = x_sample.isLost
                         sensor_data_euler.channelSamples[0].append(R_sample)
                         P = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x)))) * 180 / math.pi
-                        P_sample = Sample()
+                        P_sample = self._object_pool.acquire_sample()
                         P_sample.channelIndex = 1
                         P_sample.sampleIndex = x_sample.sampleIndex
                         P_sample.timeStampInMs = x_sample.timeStampInMs
@@ -1238,7 +1382,7 @@ class SensorProfileDataCtx:
                         P_sample.isLost = x_sample.isLost
                         sensor_data_euler.channelSamples[1].append(P_sample)
                         Y = math.atan2(2 * (w * z + x * y), 1 - 2 * (y ** 2 + z ** 2)) * 180 / math.pi
-                        Y_sample = Sample()
+                        Y_sample = self._object_pool.acquire_sample()
                         Y_sample.channelIndex = 2
                         Y_sample.sampleIndex = x_sample.sampleIndex
                         Y_sample.timeStampInMs = x_sample.timeStampInMs
@@ -1252,13 +1396,15 @@ class SensorProfileDataCtx:
             self.sendSensorData(sensor_data_quat, buf)
             self.sendSensorData(sensor_data_euler, buf)
 
+        return ok
+
     def checkReadSamples(self, data: bytes, sensorData: SensorData, dataOffset: int, dataGap: int, on_error_callback=None):
         offset = 1
 
         if not self._is_data_transfering:
-            return False
+            return ReadSamplesResult.Error
         if sensorData is None or sensorData.packageSampleCount <= 0 or sensorData.channelCount <= 0 or sensorData.minPackageSampleCount <= 0 or sensorData.K <= 0:
-            return False
+            return ReadSamplesResult.Error
         try:
             packageIndex = 0
             maxPackageIndex = 0
@@ -1284,7 +1430,7 @@ class SensorProfileDataCtx:
                 if packageIndex < lastPackageIndex:
                     packageIndex += maxPackageIndex + 1
                 elif packageIndex == lastPackageIndex:
-                    return False
+                    return ReadSamplesResult.Repeated
 
                 deltaPackageIndex = packageIndex - lastPackageIndex
                 lostPackageCounter = deltaPackageIndex - 1
@@ -1296,6 +1442,11 @@ class SensorProfileDataCtx:
 
                 if deltaPackageIndex > 1:
                     lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
+                    SdkLog.i(_TAG, (
+                        "MSG|LOST SAMPLE|MAC|" + str(sensorData.deviceMac)
+                        + "|TYPE|" + str(sensorData.dataType)
+                        + "|COUNT|" + str(lostSampleCount)
+                    ))
 
                     if lostSampleCount < 100:
                         self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
@@ -1306,22 +1457,6 @@ class SensorProfileDataCtx:
                         sensorData.lastPackageIndex = newPackageIndex - 1
                     sensorData.lastPackageCounter += deltaPackageIndex - 1
 
-
-                    lostLog = (
-                            "MSG|LOST SAMPLE|MAC|"
-                            + str(sensorData.deviceMac)
-                            + "|TYPE|"
-                            + str(sensorData.dataType)
-                            + "|COUNT|"
-                            + str(lostSampleCount)
-                    )
-                    # print(lostLog)
-                    if on_error_callback is not None:
-                        try:
-                            asyncio.get_event_loop().run_in_executor(None, on_error_callback, lostLog)
-                        except Exception as e:
-                            SdkLog.exception(_TAG, "Unexpected error")
-
                 sensorData.lastPackageIndex = newPackageIndex
 
             if dataGap >= 0:
@@ -1330,8 +1465,8 @@ class SensorProfileDataCtx:
             sensorData.lastPackageCounter += 1
         except Exception as e:
             SdkLog.exception(_TAG, "Unexpected error")
-            return False
-        return True
+            return ReadSamplesResult.Error
+        return ReadSamplesResult.OK
 
     def transTrainData(self, data: int) -> int:
         xout = data >> 4
@@ -1348,9 +1483,15 @@ class SensorProfileDataCtx:
             lostSampleCount: int,
     ):
         sampleCount = sensorData.packageSampleCount
+        def _type_name():
+            try:
+                return DataType(sensorData.dataType).name
+            except Exception:
+                return str(sensorData.dataType)
+
         if lostSampleCount <= 0:
             if data is None or offset < 0 or offset > len(data):
-                raise ValueError("Invalid data or offset")
+                raise ValueError(f"Invalid data or offset for data type {_type_name()}")
 
             if sensorData.resolutionBits in (7, 8):
                 bytesPerChannel = 1
@@ -1371,11 +1512,11 @@ class SensorProfileDataCtx:
                     realChannelCount += 1
 
             if offset + ((bytesPerChannel  * realChannelCount * sampleCount) + (dataGap * (sampleCount - 1)))  > dataLength:
-                raise ValueError(f"Invalid dataLength:{dataLength}")
+                raise ValueError(f"Invalid dataLength:{dataLength} for data type {_type_name()}")
         
 
         sampleInterval = (
-            1000 // sensorData.sampleRate if sensorData.sampleRate > 0 else 0
+            int(1000.0 / sensorData.sampleRate) if sensorData.sampleRate > 0 else 0
         )
         if lostSampleCount > 0:
             sampleCount = lostSampleCount
@@ -1408,7 +1549,7 @@ class SensorProfileDataCtx:
 
                     impedanceChannelIndex += 1
 
-                    dataItem = Sample()
+                    dataItem = self._object_pool.acquire_sample()
                     dataItem.channelIndex = channelIndex
                     dataItem.sampleIndex = lastSampleIndex
                     dataItem.timeStampInMs = lastSampleIndex * sampleInterval
@@ -1452,7 +1593,9 @@ class SensorProfileDataCtx:
                                 rawData = struct.unpack_from("<I", data, offset)[0]
                             offset += 4
                         elif sensorData.resolutionBits == 32:
-                            rawData = struct.unpack_from("f", data, offset)[0]
+                            # 32-bit float: rawData 不存浮点，避免 FlatBuffers 整型字段异常
+                            rawData = 0
+                            converted = struct.unpack_from("f", data, offset)[0]
                             offset += 4
                         elif sensorData.resolutionBits == 33:
                             if (sensorData.resolutionSigned):
@@ -1465,7 +1608,11 @@ class SensorProfileDataCtx:
                             offset += 2
                             rawData = self.transTrainData(rawData)
 
-                        converted = rawData * K
+                        if sensorData.resolutionBits == 32:
+                            # converted 已在上面赋值（float 原始值）
+                            pass
+                        else:
+                            converted = rawData * K
                         dataItem.rawData = rawData
                         dataItem.data = converted
                         dataItem.impedance = impedance
@@ -1477,7 +1624,7 @@ class SensorProfileDataCtx:
             lastSampleIndex += 1
             offset += dataGap
 
-    def sendSensorData(self, sensorData: SensorData, buf: Queue[SensorData]) -> None:
+    def sendSensorData(self, sensorData: SensorData, buf: Queue[bytes]):
         oldChannelSamples = sensorData.channelSamples
 
         if not self.isDataTransfering or len(oldChannelSamples) == 0:
@@ -1508,7 +1655,7 @@ class SensorProfileDataCtx:
                         pass
                 resultChannelSamples.append(newSamples)
 
-            sensorDataResult = SensorData()
+            sensorDataResult = self._object_pool.acquire_sensor_data()
             sensorDataResult.channelSamples = resultChannelSamples
             sensorDataResult.dataType = sensorData.dataType
             sensorDataResult.deviceMac = sensorData.deviceMac
@@ -1560,17 +1707,28 @@ class SensorProfileDataCtx:
 
         for sensorDataResult in sensorDataList:
             self._write_data_log_parsed(sensorDataResult)
-            buf.put(sensorDataResult)
+            try:
+                fb_bytes = sensorDataResult.to_flatbuffers()
+                buf.put_nowait(fb_bytes)
+            except Full:
+                SdkLog.w(_TAG, "Parsed data queue full, dropping sensor data batch")
+            except Exception as e:
+                SdkLog.e(_TAG, f"Failed to serialize SensorData to FlatBuffers: {e}")
+            finally:
+                # 结果对象已序列化为 FlatBuffers，可归还对象池
+                self._object_pool.release_sensor_data(sensorDataResult)
 
-    async def processUniversalData(self, buf: Queue[SensorData], on_data_callback, on_error_callback=None):
+    async def _processUniversalData(self, buf: Queue[bytes], on_data_callback, on_error_callback=None):
 
         while self._is_running:
             while self._is_running and self._rawDataBuffer.empty():
                 if self._is_running and self.isDataTransfering and not buf.empty():
                     sensorData: SensorData = None
                     try:
-                        sensorData = buf.get_nowait()
-                    except Exception:
+                        fb_bytes = buf.get_nowait()
+                        sensorData = self._object_pool.acquire_sensor_data()
+                        sensorData = SensorData.from_flatbuffers_pooled(fb_bytes, sensorData, self._object_pool)
+                    except Exception as e:
                         break
                     if not sensor_utils._terminated and sensorData != None and on_data_callback != None:
                         try:
@@ -1588,8 +1746,12 @@ class SensorProfileDataCtx:
                 while self._is_running and not self._rawDataBuffer.empty():
                     data = self._rawDataBuffer.get_nowait()
                     self._write_data_log_raw(data)
+                    if len(self._concatDataBuffer) > _MAX_CONCAT_BUFFER_SIZE:
+                        SdkLog.w(_TAG, f"Concat buffer exceeded {_MAX_CONCAT_BUFFER_SIZE}, clearing")
+                        self._concatDataBuffer.clear()
                     self._concatDataBuffer.extend(data)
                     self._rawDataBuffer.task_done()
+                    self._last_progress_time = time.time()
             except Exception as e:
                 SdkLog.exception(_TAG, "Error reading raw data buffer")
 
@@ -1616,8 +1778,8 @@ class SensorProfileDataCtx:
                         continue
                     if self._is_data_transfering:
                         data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                        self._processDataPackage(data_package, buf, on_error_callback)
-                    last_cut = index = index + 2 + n + 1
+                        if self._processDataPackage(data_package, buf, on_error_callback):
+                            last_cut = index = index + 2 + n + 1
                     index += 1
                 elif self._concatDataBuffer[index] == 0xAA:
                     if (index + 1) >= data_size:

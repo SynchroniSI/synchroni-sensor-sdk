@@ -680,7 +680,13 @@ class GForce:
                 has_res=True,
             )
         )
-        return buf.decode("utf-8")
+        # 硬件版本定义：temp[2]=SYS_HARDWARE_REV_ADDR, temp[3]=SYS_HARDWARE_TYPE_ADDR
+        # 响应数据中前两个字节分别为硬件版本号和硬件类型
+        if len(buf) >= 2:
+            return f"{buf[0]}.{buf[1]}"
+        if len(buf) == 1:
+            return str(buf[0])
+        return "0"
 
     async def get_model_number(self) -> str:
         buf = await self._send_request(
@@ -727,6 +733,8 @@ class GForce:
                 has_res=True,
             )
         )
+        if buf is None or len(buf) == 0:
+            return -1
         return int.from_bytes(buf, byteorder="big")
 
     async def get_temperature(self) -> int:
@@ -736,6 +744,8 @@ class GForce:
                 has_res=True,
             )
         )
+        if buf is None or len(buf) == 0:
+            return -1
         return int.from_bytes(buf, byteorder="big")
 
     async def power_off(self) -> None:

@@ -1,5 +1,6 @@
 import sys
 import signal
+import multiprocessing
 from typing import List
 
 import matplotlib
@@ -234,8 +235,17 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("Not Connected")
         controls_layout.addWidget(self.status_label)
 
+        device_info_layout = QtWidgets.QHBoxLayout()
+        self.model_label = QtWidgets.QLabel("Model: --")
+        self.hw_version_label = QtWidgets.QLabel("HW Version: --")
+        self.fw_version_label = QtWidgets.QLabel("FW Version: --")
         self.power_label = QtWidgets.QLabel("Power: --%")
-        controls_layout.addWidget(self.power_label)
+        device_info_layout.addWidget(self.model_label)
+        device_info_layout.addWidget(self.hw_version_label)
+        device_info_layout.addWidget(self.fw_version_label)
+        device_info_layout.addWidget(self.power_label)
+        device_info_layout.addStretch()
+        controls_layout.addLayout(device_info_layout)
 
         debug_log_group = QtWidgets.QGroupBox("Debug Log")
         debug_log_layout = QtWidgets.QVBoxLayout()
@@ -375,6 +385,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
             info = sensor.getDeviceInfo()
             self._init_buffers(sensor, info)
+            self.model_label.setText(f"Model: {info.ModelName}")
+            self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
+            self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
             self.status_label.setText(
                 f"Connected: {device.Name} | "
                 f"ACC {info.AccChannelCount}ch @ {info.AccSampleRate}Hz | "
@@ -415,6 +428,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             for cb in self._filter_checkboxes.values():
                 cb.setEnabled(False)
             self.status_label.setText("Disconnecting...")
+            self.model_label.setText("Model: --")
+            self.hw_version_label.setText("HW Version: --")
+            self.fw_version_label.setText("FW Version: --")
             self.power_label.setText("Power: --%")
 
     # ── Data Buffers ──────────────────────────────────────────────────────────
@@ -469,6 +485,10 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         return lock
 
     def _dispatch_data(self, data: SensorData):
+        if data.lostPackageCount > 0:
+            type_name = DataType(data.dataType).name if data.dataType is not None else "Unknown"
+            self.lost_packet_signal.emit(type_name, data.lostPackageCount)
+
         task = DataTask(self._append_to_buffer, data)
         pool = self._get_data_type_pool(data.dataType)
         pool.start(task)
@@ -899,6 +919,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self._pending_device = None
             self.current_sensor = None
             self._clear_ui_data()
+            self._clear_lost_packet_stats()
             self._do_connect_device(pending)
             return
 
@@ -911,36 +932,23 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         for cb in self._filter_checkboxes.values():
             cb.setEnabled(False)
         self.status_label.setText("Disconnected (device)")
+        self.model_label.setText("Model: --")
+        self.hw_version_label.setText("HW Version: --")
+        self.fw_version_label.setText("FW Version: --")
         self.power_label.setText("Power: --%")
+        self._clear_lost_packet_stats()
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
-        try:
-            parts = reason.split("|")
-            if "LOST SAMPLE" in parts:
-                lost_type = None
-                lost_count = None
-                for i, part in enumerate(parts):
-                    if part == "TYPE" and i + 1 < len(parts):
-                        lost_type = parts[i + 1]
-                    elif part == "COUNT" and i + 1 < len(parts):
-                        lost_count = int(parts[i + 1])
-                if lost_type is not None and lost_count is not None:
-                    self.lost_packet_signal.emit(lost_type, lost_count)
-        except Exception as e:
-            print(f"Error parsing packet loss info: {e}")
-
-    def _lost_type_name(self, type_str: str) -> str:
-        try:
-            return DataType(int(type_str, 0)).name
-        except (ValueError, KeyError):
-            return f"TYPE {type_str}"
 
     def _update_lost_packet_display(self, lost_type: str, count: int):
-        type_name = self._lost_type_name(lost_type)
-        self.lost_packet_counts[type_name] = self.lost_packet_counts.get(type_name, 0) + count
+        self.lost_packet_counts[lost_type] = count
         lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
         self.lost_packet_label.setText("Packet Loss Stats:\n" + "\n".join(lines))
+
+    def _clear_lost_packet_stats(self):
+        self.lost_packet_counts.clear()
+        self.lost_packet_label.setText("Packet Loss Stats: None")
 
     def _handle_gesture_data(self, data: SensorData):
         if not data.channelSamples:
@@ -1117,6 +1125,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
+    # PyInstaller 打包后，multiprocessing 子进程必须调用 freeze_support()
+    multiprocessing.freeze_support()
     app = QtWidgets.QApplication(sys.argv)
     window = IMUQuaternionEMGDemo()
 

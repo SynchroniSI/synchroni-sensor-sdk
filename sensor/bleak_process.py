@@ -868,7 +868,7 @@ class BleakProcess(multiprocessing.Process):
             self._publish("error", device_mac=device_mac, message=message)
 
         # 持续运行，异常后自动重启，避免单包错误导致整个解析线程退出
-        while self._is_running and device_mac in self._data_ctxs:
+        while not self._should_exit and device_mac in self._data_ctxs:
             try:
                 if ctx.isUniversalStream:
                     await ctx._processUniversalData(local_buf, on_data, on_error)

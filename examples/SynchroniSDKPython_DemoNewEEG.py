@@ -275,6 +275,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
             "NTF_ECG":  QtWidgets.QCheckBox("ECG"),
             "NTF_BRTH": QtWidgets.QCheckBox("BRTH"),
+            "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)

@@ -1111,6 +1111,12 @@ class BleakProcess(multiprocessing.Process):
             sorted_keys = sorted(ctx.notify_map.keys())
             result = "|".join(f"{k}|{ctx.notify_map[k]}" for k in sorted_keys)
 
+        if key == "NTF_IMU":
+            imu_sub_keys = ["NTF_GFORCE_ACC", "NTF_GFORCE_GYRO", "NTF_GFORCE_QUAT", "NTF_GFORCE_EULER"]
+            result = "ON" if all(ctx.notify_map.get(k) == "ON" for k in imu_sub_keys) else "OFF"
+        elif key in ctx.notify_map:
+            result = ctx.notify_map[key]
+
         if key == "DEBUG_LOG_PATH":
             result = SdkLog.get_log_path() or ""
 
@@ -1168,6 +1174,12 @@ class BleakProcess(multiprocessing.Process):
                 if key == "NTF_PPG_RAW":
                     map_key = "NTF_PPG"
 
+                # IMU 总开关同时控制 ACC/GYRO/QUAT/EULER
+                imu_sub_keys = ["NTF_GFORCE_ACC", "NTF_GFORCE_GYRO", "NTF_GFORCE_QUAT", "NTF_GFORCE_EULER"]
+                if map_key == "NTF_IMU":
+                    for sub in imu_sub_keys:
+                        ctx.notify_map[sub] = value
+
                 # 老版本 EMG 设备上 Gesture 与 EMG 互斥，自动切换
                 if not ctx.isNewEMG:
                     if map_key == "NTF_GEST" and value == "ON" and ctx.notify_map.get("NTF_EMG") == "ON":
@@ -1182,17 +1194,40 @@ class BleakProcess(multiprocessing.Process):
                         ctx.notify_map[map_key] = value
                         result = "OK"
                 else:
+                    # 新 EMG：Gesture 依赖 EMG 数据，关闭 EMG 时同步关闭 Gesture；打开 Gesture 时自动打开 EMG
+                    if map_key == "NTF_EMG" and value == "OFF":
+                        ctx.notify_map["NTF_GEST"] = "OFF"
+                    elif map_key == "NTF_GEST" and value == "ON" and ctx.notify_map.get("NTF_EMG") != "ON":
+                        ctx.notify_map["NTF_EMG"] = "ON"
                     ctx.notify_map[map_key] = value
                     result = "OK"
-                if result == "OK" and ctx.hasInit() and ctx.isDataTransfering:
+
+                # 单个 IMU 子开关变化时，同步更新 NTF_IMU 总开关的聚合状态
+                if map_key in imu_sub_keys:
+                    ctx.notify_map["NTF_IMU"] = "ON" if all(ctx.notify_map.get(k) == "ON" for k in imu_sub_keys) else "OFF"
+
+                if result == "OK" and ctx.hasInit():
                     ctx._buildNotifyDataFlag()
-                    needs_restart = True
-                    if ctx.getChipType() == BLEChipType.OYM:
+
+                    # 新 EMG 设备通过 function switch 控制 EMG/Gesture 输出，bit0=gesture, bit1=emg
+                    if ctx.isNewEMG and map_key in ("NTF_EMG", "NTF_GEST"):
+                        emg_bit = 1 if ctx.notify_map.get("NTF_EMG") == "ON" else 0
+                        gest_bit = 1 if (emg_bit and ctx.notify_map.get("NTF_GEST") == "ON") else 0
+                        func_switch = (emg_bit << 1) | gest_bit
                         try:
-                            await ctx.gForce.set_subscription(ctx.notifyDataFlag)
+                            await ctx.gForce.set_function_switch(func_switch)
+                            await asyncio.sleep(0.5)
                         except Exception as e:
-                            SdkLog.exception(_TAG, f"_do_set_param set_subscription failed: {device_mac}")
-                            result = "ERROR: set_subscription fail: " + str(e)
+                            SdkLog.exception(_TAG, f"_do_set_param set_function_switch failed: {device_mac}")
+                            result = "ERROR: set_function_switch fail: " + str(e)
+                    elif ctx.isDataTransfering:
+                        needs_restart = True
+                        if ctx.getChipType() == BLEChipType.OYM:
+                            try:
+                                await ctx.gForce.set_subscription(ctx.notifyDataFlag)
+                            except Exception as e:
+                                SdkLog.exception(_TAG, f"_do_set_param set_subscription failed: {device_mac}")
+                                result = "ERROR: set_subscription fail: " + str(e)
 
         if key in ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"]:
             if value in ["ON", "OFF"]:

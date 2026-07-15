@@ -395,8 +395,12 @@ class SensorProfileDataCtx:
         config.batch_len = 128
 
         if isNewEMG:
-            await self.gForce.set_function_switch(0b11)
-    
+            # 新版 EMG：bit0=gesture，bit1=emg；Gesture 依赖 EMG，EMG 关闭时 Gesture 同步关闭
+            emg_bit = 1 if self.notify_map.get("NTF_EMG") == "ON" else 0
+            gest_bit = 1 if (emg_bit and self.notify_map.get("NTF_GEST") == "ON") else 0
+            await self.gForce.set_function_switch((emg_bit << 1) | gest_bit)
+            await asyncio.sleep(0.5)
+
         await self.gForce.set_emg_raw_data_config(config)
         await self.gForce.set_package_id(True)
 

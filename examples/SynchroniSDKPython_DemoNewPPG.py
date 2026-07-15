@@ -258,6 +258,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
             "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
             "NTF_PPG":  QtWidgets.QCheckBox("PPG"),
             "NTF_SPO2": QtWidgets.QCheckBox("SpO2"),
+            "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)

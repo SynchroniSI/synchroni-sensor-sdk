@@ -263,6 +263,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._ntf_checkboxes = {
             "NTF_EMG":   QtWidgets.QCheckBox("EMG RAW"),
             "NTF_GEST":  QtWidgets.QCheckBox("GESTURE"),
+            "NTF_IMU":   QtWidgets.QCheckBox("IMU"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)

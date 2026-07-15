@@ -1106,39 +1106,44 @@ class SensorProfileDataCtx:
                 SdkLog.exception(_TAG, "Unexpected error")
 
             if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
-                index = 0
-                last_cut = -1
-                data_size = len(self._concatDataBuffer)
-
-                while self._is_running:
-                    if index >= data_size:
-                        break
-
-                    if self._concatDataBuffer[index] == 0x55:
-                        if (index + 1) >= data_size:
-                            index = data_size
-                            continue
-                        n = self._concatDataBuffer[index + 1]
-                        if n < 2 or (index + 1 + n + 1) >= data_size:
-                            index += 1
-                            continue
-                        crc8 = (self._concatDataBuffer[index + 1 + n + 1])
-                        calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2: index + 2 + n])
-                        if crc8 != calc_crc:
-                            index += 1
-                            continue
-                        if self._is_data_transfering:
-                            data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                            if self._processDataPackage(data_package, buf, on_error_callback):
-                                last_cut = index = index + 2 + n
-                        index += 1
-                    else:
-                        index += 1
-
-                if last_cut > 0:
-                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
-                    last_cut = -1
+                try:
                     index = 0
+                    last_cut = -1
+                    data_size = len(self._concatDataBuffer)
+
+                    while self._is_running:
+                        if index >= data_size:
+                            break
+
+                        if self._concatDataBuffer[index] == 0x55:
+                            if (index + 1) >= data_size:
+                                index = data_size
+                                continue
+                            n = self._concatDataBuffer[index + 1]
+                            if n < 2 or (index + 1 + n + 1) >= data_size:
+                                index += 1
+                                continue
+                            crc8 = (self._concatDataBuffer[index + 1 + n + 1])
+                            calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2: index + 2 + n])
+                            if crc8 != calc_crc:
+                                index += 1
+                                continue
+                            if self._is_data_transfering:
+                                data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+                                if self._processDataPackage(data_package, buf, on_error_callback):
+                                    last_cut = index = index + 2 + n
+                            index += 1
+                        else:
+                            index += 1
+
+                    if last_cut > 0:
+                        self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
+                        last_cut = -1
+                        index = 0
+
+                    self._last_progress_time = time.time()
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error in concat data processing")
 
     def _processDataPackage(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         if not data:
@@ -1274,10 +1279,18 @@ class SensorProfileDataCtx:
         for index in range(channelCount):
             samples = []
             sample = self._object_pool.acquire_sample()
-            sample.rawData = int(saturationData[index])
-            sample.data = impedanceData[index]
-            sample.impedance = impedanceData[index]
-            sample.saturation = saturationData[index]
+
+            impedanceValue = impedanceData[index]
+            saturationValue = saturationData[index]
+            if not math.isfinite(impedanceValue):
+                impedanceValue = 0.0
+            if not math.isfinite(saturationValue):
+                saturationValue = 0.0
+
+            sample.rawData = int(saturationValue)
+            sample.data = impedanceValue
+            sample.impedance = impedanceValue
+            sample.saturation = saturationValue
             sample.sampleIndex = lastSampleIndex
             sample.timeStampInMs = int(lastSampleIndex * sampleInterval)
             sample.channelIndex = index
@@ -1794,55 +1807,60 @@ class SensorProfileDataCtx:
             except Exception as e:
                 SdkLog.exception(_TAG, "Error reading raw data buffer")
 
-            index = 0
-            last_cut = -1
-            data_size = len(self._concatDataBuffer)
-
-            while self._is_running:
-                if index >= data_size:
-                    break
-
-                if self._concatDataBuffer[index] == 0x55:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    if self._is_data_transfering:
-                        data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                        if self._processDataPackage(data_package, buf, on_error_callback):
-                            last_cut = index = index + 2 + n + 1
-                    index += 1
-                elif self._concatDataBuffer[index] == 0xAA:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-
-                    if not sensor_utils._terminated:
-                        await self.gForce.async_on_cmd_response(data_package)
-                    last_cut = index = index + 2 + n + 1
-                    index += 1
-                else:
-                    index += 1
-
-            if last_cut > 0:
-                self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
-                last_cut = -1
+            try:
                 index = 0
+                last_cut = -1
+                data_size = len(self._concatDataBuffer)
+
+                while self._is_running:
+                    if index >= data_size:
+                        break
+
+                    if self._concatDataBuffer[index] == 0x55:
+                        if (index + 1) >= data_size:
+                            index = data_size
+                            continue
+                        n = self._concatDataBuffer[index + 1]
+                        if n < 2 or (index + 1 + n + 2) >= data_size:
+                            index += 1
+                            continue
+                        crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                        calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
+                        if crc16 != calc_crc:
+                            index += 1
+                            continue
+                        if self._is_data_transfering:
+                            data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+                            if self._processDataPackage(data_package, buf, on_error_callback):
+                                last_cut = index = index + 2 + n + 1
+                        index += 1
+                    elif self._concatDataBuffer[index] == 0xAA:
+                        if (index + 1) >= data_size:
+                            index = data_size
+                            continue
+                        n = self._concatDataBuffer[index + 1]
+                        if n < 2 or (index + 1 + n + 2) >= data_size:
+                            index += 1
+                            continue
+                        crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                        calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
+                        if crc16 != calc_crc:
+                            index += 1
+                            continue
+                        data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+
+                        if not sensor_utils._terminated:
+                            await self.gForce.async_on_cmd_response(data_package)
+                        last_cut = index = index + 2 + n + 1
+                        index += 1
+                    else:
+                        index += 1
+
+                if last_cut > 0:
+                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
+                    last_cut = -1
+                    index = 0
+
+                self._last_progress_time = time.time()
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error in universal concat data processing")

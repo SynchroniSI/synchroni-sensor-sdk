@@ -867,15 +867,24 @@ class BleakProcess(multiprocessing.Process):
         def on_error(message: str):
             self._publish("error", device_mac=device_mac, message=message)
 
-        try:
-            if ctx.isUniversalStream:
-                await ctx._processUniversalData(local_buf, on_data, on_error)
-            else:
-                await ctx._process_data(local_buf, on_data, on_error)
-        except asyncio.CancelledError as e:
-            SdkLog.exception(_TAG, "Data loop cancelled")
-        except Exception as e:
-            SdkLog.exception(_TAG, "Error in data loop")
+        # 持续运行，异常后自动重启，避免单包错误导致整个解析线程退出
+        while self._is_running and device_mac in self._data_ctxs:
+            try:
+                if ctx.isUniversalStream:
+                    await ctx._processUniversalData(local_buf, on_data, on_error)
+                else:
+                    await ctx._process_data(local_buf, on_data, on_error)
+                # 正常返回说明 ctx 已关闭或停止
+                break
+            except asyncio.CancelledError:
+                SdkLog.i(_TAG, f"Data loop cancelled: {device_mac}")
+                break
+            except Exception as e:
+                SdkLog.exception(_TAG, f"Error in data loop, restarting: {device_mac}")
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    break
 
     async def _do_start_notification(self, cmd: dict):
 

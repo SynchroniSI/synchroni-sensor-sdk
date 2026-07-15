@@ -549,7 +549,7 @@ class SensorProfileDataCtx:
     async def initIMU(self, packageCount: int) -> int:
         SdkLog.d(_TAG, "initIMU(...)")
         IMU_TYPE_QAT6 = 0x0004
-        min_package_sample_count = 2
+        min_package_sample_count = 2 if self._chip_type == BLEChipType.OYM else 1
         self.isContainQAT6 = False
 
         if not self.hasIMU():
@@ -1247,7 +1247,11 @@ class SensorProfileDataCtx:
             if on_error_callback:
                 on_error_callback("Incomplete Impedance packet received")
             return False
-        
+
+        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
+        self.checkReadSamples(data, sensor_data, 0, -1, on_error_callback)
+        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
+
         for index in range(channelCount):
             impedance = struct.unpack_from("<f", data, offset)[0]
             offset += 4
@@ -1264,10 +1268,6 @@ class SensorProfileDataCtx:
 
         self.impedanceData = impedanceData
         self.saturationData = saturationData
-
-        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
-        self.checkReadSamples(data, sensor_data, 0, -1)
-        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
         lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
 
         sensor_data.channelSamples = []
@@ -1298,7 +1298,8 @@ class SensorProfileDataCtx:
         if sensor_data_quat is not None:
             frameSize += 12
 
-        return len(data) >= dataOffset + sensor_data_ref.packageSampleCount * frameSize
+        expected = dataOffset + sensor_data_ref.packageSampleCount * frameSize
+        return len(data) == expected
     
     def _process_imu_samples(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
@@ -1435,9 +1436,16 @@ class SensorProfileDataCtx:
                 + bytesPerChannel * realChannelCount * sensorData.packageSampleCount
                 + dataGap * (sensorData.packageSampleCount - 1)
             )
-            if expected > len(data):
-                SdkLog.e(_TAG, f"Invalid dataLength:{len(data)} for data type {_type_name()}")
-                return ReadSamplesResult.Error
+            if dataGap == 0:
+                # 单一流数据包：要求长度完全一致
+                if expected != len(data):
+                    SdkLog.i(_TAG, f"Invalid dataLength:{len(data)} (expected {expected}) for data type {_type_name()}")
+                    return ReadSamplesResult.Error
+            else:
+                # IMU 复合包：允许包含多个子流，只检查长度不足
+                if expected > len(data):
+                    SdkLog.i(_TAG, f"Invalid dataLength:{len(data)} (expected at least {expected}) for data type {_type_name()}")
+                    return ReadSamplesResult.Error
 
         try:
             packageIndex = 0
@@ -1457,39 +1465,58 @@ class SensorProfileDataCtx:
                 offset += sensorData.packageIndexLength
                 newPackageIndex = packageIndex
                 lastPackageIndex = sensorData.lastPackageIndex
-                if sensorData.lastPackageCounter < 0 and newPackageIndex > 0:
-                    sensorData.lastPackageIndex = lastPackageIndex = newPackageIndex - 1
-                    sensorData.lastPackageCounter = 0
 
-                if packageIndex < lastPackageIndex:
-                    packageIndex += maxPackageIndex + 1
-                elif packageIndex == lastPackageIndex:
+                # 首包：把上一包序号设为合法的前一个值，便于后续统一判断
+                if sensorData.lastPackageCounter < 0:
+                    sensorData.lastPackageCounter = 0
+                    if newPackageIndex > 0:
+                        lastPackageIndex = newPackageIndex - 1
+                    else:
+                        lastPackageIndex = maxPackageIndex
+                    sensorData.lastPackageIndex = lastPackageIndex
+
+                # 合法翻卷区间：last 在 [max-2, max] 且 new 在 [0, 2]
+                if newPackageIndex <= 2 and lastPackageIndex >= maxPackageIndex - 2:
+                    packageIndex = maxPackageIndex + 1 + newPackageIndex
+                elif newPackageIndex == lastPackageIndex:
                     return ReadSamplesResult.Repeated
+                elif newPackageIndex < lastPackageIndex:
+                    SdkLog.i(_TAG, (
+                        "Illegal package index backward|MAC|" + str(sensorData.deviceMac)
+                        + "|TYPE|" + str(sensorData.dataType)
+                        + "|LAST_IDX|" + str(lastPackageIndex)
+                        + "|CURR_IDX|" + str(newPackageIndex)
+                        + "|DELTA|" + str(lastPackageIndex - newPackageIndex)
+                    ))
+                    return ReadSamplesResult.Error
 
                 deltaPackageIndex = packageIndex - lastPackageIndex
+                if deltaPackageIndex > 20:
+                    SdkLog.i(_TAG, (
+                        "Illegal package index jump|MAC|" + str(sensorData.deviceMac)
+                        + "|TYPE|" + str(sensorData.dataType)
+                        + "|LAST_IDX|" + str(lastPackageIndex)
+                        + "|CURR_IDX|" + str(newPackageIndex)
+                        + "|DELTA|" + str(deltaPackageIndex)
+                    ))
+                    return ReadSamplesResult.Error
+
                 lostPackageCounter = deltaPackageIndex - 1
-                if lostPackageCounter > 65534:
-                    lostPackageCounter = 1
-                elif lostPackageCounter > 50:
-                    lostPackageCounter = 50
                 sensorData.lostPackageCount = sensorData.lostPackageCount + lostPackageCounter
 
                 if deltaPackageIndex > 1:
-                    lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
+                    lostSampleCount = sensorData.packageSampleCount * lostPackageCounter
                     SdkLog.i(_TAG, (
                         "MSG|LOST SAMPLE|MAC|" + str(sensorData.deviceMac)
                         + "|TYPE|" + str(sensorData.dataType)
                         + "|COUNT|" + str(lostSampleCount)
                     ))
 
-                    if lostSampleCount < 100:
+                    if lostPackageCounter < 20:
                         self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
 
-                    if newPackageIndex == 0:
-                        sensorData.lastPackageIndex = maxPackageIndex
-                    else:
-                        sensorData.lastPackageIndex = newPackageIndex - 1
-                    sensorData.lastPackageCounter += deltaPackageIndex - 1
+                    sensorData.lastPackageIndex = newPackageIndex - 1
+                    sensorData.lastPackageCounter += lostPackageCounter
 
                 sensorData.lastPackageIndex = newPackageIndex
 

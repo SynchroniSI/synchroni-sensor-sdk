@@ -1,7 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
 
-rem 切换到脚本所在目录（examples）
 cd /d "%~dp0"
 
 echo ==========================================
@@ -46,7 +45,6 @@ for %%F in (DemoNewEMG DemoNewEEG DemoNewPPG SynchroniSDKPython_DemoNewEMG Synch
     )
 )
 
-rem 也清理项目根目录下可能存在的旧 .spec
 del /f /q "..\*.spec" >nul 2>&1
 
 echo.

@@ -3,7 +3,7 @@
 某些 Windows 主机上 write-with-response 会因为系统 ACK 等待导致命令超时，
 把命令特征强制改成无响应写入可以显著提升命令通道的实时性。
 
-默认只作用于 SDK 已知的两个 CMD 特征 UUID；传入空列表或 `None` 则全局生效。
+默认只作用于 SDK 已知的两个 CMD 特征 UUID；传 `None` 则全局生效，空列表表示不匹配任何特征。
 """
 
 import logging
@@ -53,6 +53,7 @@ def apply(cmd_char_uuids=DEFAULT_CMD_CHAR_UUIDS):
         return await orig_write(self, char_specifier, data, response=response)
 
     BleakClient.write_gatt_char = patched_write
+    BleakClient._orig_write_gatt_char = orig_write  # type: ignore[attr-defined]
     BleakClient._no_ack_patched = True  # type: ignore[attr-defined]
     logger.debug(
         "Applied bleak write-without-response patch (targets: %s)",
@@ -70,6 +71,8 @@ def reset():
     if not getattr(BleakClient, "_no_ack_patched", False):
         return
 
-    # 找到原始的未绑定方法比较麻烦，这里简单把标记清掉，
-    # 实际撤销需要保存原始方法；apply 没有保存，故 reset 仅作占位。
+    orig_write = getattr(BleakClient, "_orig_write_gatt_char", None)
+    if orig_write is not None:
+        BleakClient.write_gatt_char = orig_write
+        del BleakClient._orig_write_gatt_char  # type: ignore[attr-defined]
     BleakClient._no_ack_patched = False  # type: ignore[attr-defined]

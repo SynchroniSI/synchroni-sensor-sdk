@@ -8,7 +8,7 @@ with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f
 
 setup(
     name="synchroni-sensor-sdk",
-    version="1.2.0",
+    version="1.2.4",
     description="Python sdk for Synchroni",
     long_description=long_description,
     long_description_content_type="text/markdown",

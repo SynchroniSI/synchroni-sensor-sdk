@@ -242,7 +242,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         controls_layout.addLayout(device_info_layout)
 
         debug_log_group = QtWidgets.QGroupBox("Debug Log")
-        debug_log_layout = QtWidgets.QVBoxLayout()
+        debug_log_layout = QtWidgets.QHBoxLayout()
         self._debug_log_checkbox = QtWidgets.QCheckBox("Enable SDK Debug Log")
         self._debug_log_checkbox.setChecked(True)
         self._debug_log_checkbox.stateChanged.connect(self._on_debug_log_toggled)
@@ -268,7 +268,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         ntf_group.setLayout(ntf_layout)
 
         filter_group = QtWidgets.QGroupBox("Filter")
-        filter_layout = QtWidgets.QVBoxLayout()
+        filter_layout = QtWidgets.QHBoxLayout()
         self._filter_checkboxes = {
             "FILTER_50HZ": QtWidgets.QCheckBox("50Hz"),
             "FILTER_60HZ": QtWidgets.QCheckBox("60Hz"),

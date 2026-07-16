@@ -25,6 +25,10 @@ OYM_DATA_NOTIFY_CHAR_UUID = "f000ffe2-0451-4000-b000-000000000000"
 RFSTAR_CMD_UUID = "00000002-0000-1000-8000-00805f9b34fb"
 RFSTAR_DATA_UUID = "00000003-0000-1000-8000-00805f9b34fb"
 
+# 异常断开后自动重连参数
+_MAX_RECONNECT_ATTEMPTS = 5
+_RECONNECT_DELAY_SECONDS = 1.0
+
 
 def _extract_mac(_device: bleak.BLEDevice, adv: AdvertisementData) -> str:
 
@@ -93,6 +97,8 @@ class BleakProcess(multiprocessing.Process):
         self._power_intervals: dict = {}  # mac -> int (ms)
         self._data_tasks: dict = {}       # mac -> asyncio.Task
         self._battery_tasks: dict = {}    # mac -> asyncio.Task
+        self._reconnect_info: dict = {}   # mac -> {cmd, attempts, task, normal_disconnect}
+        self._main_event_loop = None      # BleakProcess 主事件循环
 
         # Per-device event loops and threads
         self._event_loops: dict = {}      # mac -> asyncio.AbstractEventLoop
@@ -344,6 +350,7 @@ class BleakProcess(multiprocessing.Process):
         self._msg_queue = queue.Queue()
 
         async def _run_main():
+            self._main_event_loop = asyncio.get_running_loop()
             publisher_task = asyncio.create_task(self._publisher_task())
             try:
                 await self._main_loop()
@@ -581,6 +588,14 @@ class BleakProcess(multiprocessing.Process):
         name = cmd.get("name", "")
         service_data = cmd.get("service_data", {})
 
+        # 保存连接信息，用于异常断开后自动重连
+        self._reconnect_info[device_mac] = {
+            "cmd": cmd,
+            "attempts": 0,
+            "task": None,
+            "normal_disconnect": False,
+        }
+
         event_loop = self._event_loops.get(device_mac)
         gforce_event_loop = self._gforce_event_loop
         data_event_loop = self._data_event_loops.get(device_mac)
@@ -676,8 +691,18 @@ class BleakProcess(multiprocessing.Process):
         self._raw_bufs[device_mac] = raw_buf
         self._device_states[device_mac] = "Connected"
 
+        # 重连成功，重置重连计数
+        reconnect_info = self._reconnect_info.get(device_mac)
+        if reconnect_info is not None:
+            reconnect_info["attempts"] = 0
+
         # Create data context
-        data_ctx = SensorProfileDataCtx(gforce, device_mac, raw_buf)
+        data_ctx = SensorProfileDataCtx(
+            gforce,
+            device_mac,
+            raw_buf,
+            on_reconnect_request=lambda: self._schedule_reconnect(device_mac),
+        )
         self._data_ctxs[device_mac] = data_ctx
 
         # Start data processing loop in data_event_loop
@@ -704,6 +729,19 @@ class BleakProcess(multiprocessing.Process):
         async with lock:
             if device_mac not in self._gforces and not disconnect_client:
                 return  # Already cleaned
+
+            # 用户主动断开时标记为正常断开，并取消正在进行的自动重连
+            if disconnect_client:
+                info = self._reconnect_info.get(device_mac)
+                if info is not None:
+                    info["normal_disconnect"] = True
+                    task = info.get("task")
+                    if task is not None:
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
+                        info["task"] = None
 
             # Cancel data task (running in data_event_loop)
             if device_mac in self._data_tasks:
@@ -750,7 +788,62 @@ class BleakProcess(multiprocessing.Process):
             self._raw_bufs.pop(device_mac, None)
             self._device_states[device_mac] = "Disconnected"
 
+            # 正常断开后清理重连信息；异常断开保留以继续自动重连
+            if disconnect_client:
+                self._reconnect_info.pop(device_mac, None)
+
         self._publish("state_changed", device_mac=device_mac, state="Disconnected")
+
+    def _schedule_reconnect(self, device_mac: str):
+        """从 watchdog 线程调用，调度一次自动重连。"""
+        info = self._reconnect_info.get(device_mac)
+        if info is None or info.get("normal_disconnect"):
+            return
+        if info.get("task") is not None:
+            return  # 已有重连任务在进行
+        if info["attempts"] >= _MAX_RECONNECT_ATTEMPTS:
+            SdkLog.e(_TAG, f"Max reconnect attempts reached for {device_mac}")
+            return
+
+        info["attempts"] += 1
+        SdkLog.i(_TAG, f"Scheduling reconnect attempt {info['attempts']} for {device_mac}")
+
+        loop = self._main_event_loop
+        if loop is None or loop.is_closed():
+            SdkLog.e(_TAG, f"Main event loop not available, cannot reconnect {device_mac}")
+            return
+
+        async def _delayed_reconnect():
+            await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
+            await self._do_reconnect(device_mac)
+
+        try:
+            info["task"] = asyncio.run_coroutine_threadsafe(_delayed_reconnect(), loop)
+        except Exception as e:
+            SdkLog.exception(_TAG, f"Failed to schedule reconnect for {device_mac}: {e}")
+            info["task"] = None
+
+    async def _do_reconnect(self, device_mac: str):
+        """执行一次自动重连。"""
+        info = self._reconnect_info.get(device_mac)
+        if info is None or info.get("normal_disconnect"):
+            return
+
+        # 已经连接则无需重连
+        if device_mac in self._gforces:
+            info["task"] = None
+            return
+
+        SdkLog.i(_TAG, f"Reconnecting {device_mac}, attempt {info['attempts']}")
+        try:
+            await self._do_connect(info["cmd"])
+        except Exception as e:
+            SdkLog.exception(_TAG, f"Reconnect attempt failed for {device_mac}: {e}")
+            # 失败后会再次由 _schedule_reconnect 决定是否继续
+            self._schedule_reconnect(device_mac)
+        finally:
+            if info is not None:
+                info["task"] = None
 
     async def _do_disconnect(self, cmd: dict):
 
@@ -1160,6 +1253,8 @@ class BleakProcess(multiprocessing.Process):
 
         result = "Error: Not supported"
         needs_restart = False
+        oym_needs_subscribe = False
+        was_streaming = ctx.isDataTransfering
 
         ntf_keys = [
             "NTF_GEST", "NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH", "NTF_IMPEDANCE",
@@ -1220,14 +1315,19 @@ class BleakProcess(multiprocessing.Process):
                         except Exception as e:
                             SdkLog.exception(_TAG, f"_do_set_param set_function_switch failed: {device_mac}")
                             result = "ERROR: set_function_switch fail: " + str(e)
-                    elif ctx.isDataTransfering:
+                        if ctx.getChipType() == BLEChipType.OYM:
+                            oym_needs_subscribe = True
+                    elif was_streaming:
                         needs_restart = True
                         if ctx.getChipType() == BLEChipType.OYM:
-                            try:
-                                await ctx.gForce.set_subscription(ctx.notifyDataFlag)
-                            except Exception as e:
-                                SdkLog.exception(_TAG, f"_do_set_param set_subscription failed: {device_mac}")
-                                result = "ERROR: set_subscription fail: " + str(e)
+                            oym_needs_subscribe = True
+                    elif ctx.getChipType() == BLEChipType.OYM:
+                        # 未在传输时，直接更新 OYM 订阅掩码
+                        try:
+                            await ctx.gForce.set_subscription(ctx.notifyDataFlag)
+                        except Exception as e:
+                            SdkLog.exception(_TAG, f"_do_set_param set_subscription failed: {device_mac}")
+                            result = "ERROR: set_subscription fail: " + str(e)
 
         if key in ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"]:
             if value in ["ON", "OFF"]:
@@ -1239,10 +1339,14 @@ class BleakProcess(multiprocessing.Process):
                     SdkLog.exception(_TAG, f"_do_set_param setFilter failed: {device_mac} {key}={value}")
                     result = "ERROR: " + str(e)
 
-        if needs_restart:
+        if needs_restart or oym_needs_subscribe:
             try:
-                await ctx.stop_streaming()
-                await ctx.start_streaming()
+                if was_streaming:
+                    await ctx.stop_streaming()
+                if oym_needs_subscribe and ctx.getChipType() == BLEChipType.OYM:
+                    await ctx.gForce.set_subscription(ctx.notifyDataFlag)
+                if was_streaming:
+                    await ctx.start_streaming()
             except Exception as e:
                 SdkLog.exception(_TAG, f"_do_set_param restart stream failed: {device_mac}")
                 result = "ERROR: restart stream fail: " + str(e)

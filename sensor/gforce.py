@@ -2,6 +2,7 @@ import asyncio
 import queue
 import struct
 import platform
+import time
 from contextlib import suppress
 from datetime import datetime
 from dataclasses import dataclass
@@ -453,6 +454,8 @@ class GForce:
         self.cmd_char = cmd_char
         self.data_char = data_char
         self.responses: Dict[Command, queue.Queue] = {}
+        self.last_command_failure_time: Optional[float] = None
+        self.last_command_failure_cmd: Optional[int] = None
         self.resolution = SampleResolution.BITS_8
         self._num_channels = 8
         self._device = device
@@ -1091,6 +1094,8 @@ class GForce:
                 timeout=2
             )
         except Exception as e:
+            self.last_command_failure_time = time.time()
+            self.last_command_failure_cmd = req.cmd
             SdkLog.exception(_TAG, f"_send_request write_gatt_char failed: {req.cmd}")
             if req.has_res:
                 self.responses[req.cmd] = None

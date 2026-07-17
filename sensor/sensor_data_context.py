@@ -880,10 +880,8 @@ class SensorProfileDataCtx:
             self._device_info = info
             await self.initDataTransfer(True)
 
-            # EEG + OYM 设备默认关闭 IMU；带 PPG 的设备保留 IMU 默认开启
-            if (self._chip_type == BLEChipType.OYM
-                    and self.hasEEG()
-                    and not self.hasPPG()):
+            # 非 RFSTAR 芯片设备默认关闭 IMU（RFSTAR 保留默认开启）
+            if self._chip_type != BLEChipType.RFSTAR:
                 self.notify_map["NTF_IMU"] = "OFF"
                 self.notify_map["NTF_GFORCE_ACC"] = "OFF"
                 self.notify_map["NTF_GFORCE_GYRO"] = "OFF"

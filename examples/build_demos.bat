@@ -53,6 +53,8 @@ echo Build demos with PyInstaller...
 echo ==========================================
 set "COMMON_OPTS=--clean --noconfirm --onefile"
 
+pip install -U synchroni-sensor-sdk
+
 pyinstaller %COMMON_OPTS% --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
 if errorlevel 1 goto :error
 

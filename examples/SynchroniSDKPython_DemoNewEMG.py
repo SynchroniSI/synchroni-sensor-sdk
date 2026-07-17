@@ -15,6 +15,7 @@ from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import QRunnable, QThreadPool
 
 from sensor import *
+import sensor
 
 
 SCAN_DEVICE_PERIOD_IN_MS   = 3000
@@ -308,7 +309,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle("SynchroniSDKPython IMU + Quaternion + EMG Demo")
+        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG Demo (sensor-sdk v{sensor.__version__})")
         self.resize(1600, 900)
         self.show()
 

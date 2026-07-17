@@ -7,7 +7,7 @@ from sensor.bleak_no_ack_patch import apply as _apply_bleak_no_ack_patch
 import os
 
 # SDK 版本号（单一数据源，setup.py 打包时从这里读取）
-__version__ = "0.2.5"
+__version__ = "1.2.6"
 
 # Windows 下尝试给 bleak WinRT backend 打高吞吐率连接参数补丁
 _apply_winrt_high_throughput_patch()

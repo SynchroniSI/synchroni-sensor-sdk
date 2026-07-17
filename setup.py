@@ -8,10 +8,7 @@ with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f
     long_description = f.read()
 
 with open(os.path.join(this_directory, "sensor", "__init__.py"), "r", encoding="utf-8") as f:
-    _base_version = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', f.read(), re.M).group(1)
-_parts = _base_version.split(".")
-_parts[0] = str(int(_parts[0]) + 1)
-version = ".".join(_parts)
+    version = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', f.read(), re.M).group(1)
 
 setup(
     name="synchroni-sensor-sdk",

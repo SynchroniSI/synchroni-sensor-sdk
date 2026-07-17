@@ -47,13 +47,13 @@ for %%F in (DemoNewEMG DemoNewEEG DemoNewPPG SynchroniSDKPython_DemoNewEMG Synch
 
 del /f /q "..\*.spec" >nul 2>&1
 
+pip install -U synchroni-sensor-sdk
+
 echo.
 echo ==========================================
 echo Build demos with PyInstaller...
 echo ==========================================
 set "COMMON_OPTS=--clean --noconfirm --onefile"
-
-pip install -U synchroni-sensor-sdk
 
 pyinstaller %COMMON_OPTS% --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
 if errorlevel 1 goto :error

@@ -1,6 +1,5 @@
+import asyncio
 import signal
-import time
-from typing import List
 from sensor import *
 
 SCAN_DEVICE_PERIOD_IN_MS = 3000
@@ -95,9 +94,6 @@ def onDataCallback(sensor: SensorProfile, data: SensorData):
 
 def onPowerChanged(sensor: SensorProfile, power: int):
     print("connected sensor: " + sensor.BLEDevice.Name + " power: " + str(power))
-    if not sensor.isDataTransfering:
-        print("do disconnect")
-        sensor.disconnect()
 
 
 def onStateChanged(sensor: SensorProfile, newstate: DeviceStateEx):

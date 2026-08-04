@@ -1,29 +1,36 @@
 import asyncio
-import platform
 import queue
 import struct
-from asyncio import Queue
-from collections.abc import Callable
+import platform
+import time
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import datetime
+from dataclasses import dataclass
 from enum import IntEnum
+from typing import Optional, Dict, List
+import logging
 
 import numpy as np
 from bleak import (
+    BleakScanner,
+    BLEDevice,
+    AdvertisementData,
     BleakClient,
     BleakGATTCharacteristic,
-    BLEDevice,
 )
 
 from sensor import sensor_utils
+from sensor.sensor_device import BLEChipType
+
+from sensor.sdk_log import SdkLog
+_TAG = "GForce"
 
 
 @dataclass
 class Characteristic:
     uuid: str
     service_uuid: str
-    descriptor_uuids: list[str]
+    descriptor_uuids: List[str]
 
 
 class Command(IntEnum):
@@ -51,6 +58,7 @@ class Command(IntEnum):
     MOTOR_CONTROL = (0x24,)
     LED_CONTROL_TEST = (0x25,)
     PACKAGE_ID_CONTROL = (0x26,)
+    SEND_TRAINING_PACKAGE = (0x27,)
 
     GET_ACCELERATE_CAP = (0x30,)
     SET_ACCELERATE_CONFIG = (0x31,)
@@ -72,6 +80,8 @@ class Command(IntEnum):
 
     GET_GESTURE_CAP = (0x3C,)
     SET_GESTURE_CONFIG = (0x3D,)
+    GET_GESTURE_THRESHOLD = (0x47,)
+    SET_GESTURE_THRESHOLD = (0x48,)
 
     GET_EMG_RAWDATA_CAP = (0x3E,)
     SET_EMG_RAWDATA_CONFIG = (0x3F,)
@@ -102,9 +112,13 @@ class Command(IntEnum):
     CMD_GET_ECG_CAP = (0xA7,)
     CMD_GET_IMPEDANCE_CAP = (0xA8,)
     CMD_GET_IMU_CONFIG = (0xAC,)
+    CMD_GET_IMU_CAP = (0xAB,)
     CMD_SET_IMU_CONFIG = (0xAD,)
     CMD_GET_BLE_MTU_INFO = (0xAE,)
     CMD_GET_BRT_CONFIG = (0xB3,)
+    CMD_GET_PPG_CAP = (0xB5,)
+    CMD_GET_PPG_CONFIG = (0xB6,)
+    CMD_SET_PPG_CONFIG = (0xB7,)
 
     CMD_SET_FRIMWARE_FILTER_SWITCH = (0xAA,)
     CMD_GET_FRIMWARE_FILTER_SWITCH = (0xA9,)
@@ -152,8 +166,10 @@ class DataSubscription(IntEnum):
     # Device Log On
     LOG = (0x00000800,)
 
-    DNF_MAG_ANGLE_EXT = (0x00002000,)
+    DNF_TYPE_GEST_EXT = (0x00001000,)
 
+    DNF_MAG_ANGLE_EXT = (0x00002000,)
+    
     DNF_EEG = (0x00010000,)
 
     DNF_ECG = (0x00020000,)
@@ -167,6 +183,7 @@ class DataSubscription(IntEnum):
     DNF_BRTH = (0x00200000,)
 
     DNF_CONCAT_BLE = (0x80000000,)
+    DNF_PPG = (0x00400000,)
     # Data Notify All On
     ALL = 0xFFFFFFFF
 
@@ -196,7 +213,11 @@ class SampleResolution(IntEnum):
 
 
 class SamplingRate(IntEnum):
+    HZ_50 = (50,)
+    HZ_100 = (100,)
+    Hz_200 = (200,)
     HZ_250 = (250,)
+    HZ_400 = (400,)
     HZ_500 = (500,)
     HZ_650 = (650,)
 
@@ -310,12 +331,14 @@ class ImuRawDataConfig:
     gyroK: float = 0
 
     def to_bytes(self) -> bytes:
+        """生成 CMD_SET_IMU_CONFIG 命令体，与 Android setImuDataConfig 协议一致。
+
+        协议格式：channel_count(int32) + sample_rate(uint16) + sample_count(uint8)
+        """
         body = b""
         body += struct.pack("<i", self.channel_count)
         body += struct.pack("<H", self.fs)
         body += struct.pack("<B", self.batch_len)
-        body += struct.pack("<d", self.accK)
-        body += struct.pack("<d", self.gyroK)
         return body
 
     @classmethod
@@ -354,10 +377,47 @@ class BrthRawDataConfig:
 
 
 @dataclass
+class PpgRawDataConfig:
+    mode: int = 0
+    period: int = 0
+    fs: int = 0  # rawSampleRate
+    batch_len: int = 0  # rawSampleCount
+    reserved: List[int] = None  # 5 bytes reserved
+
+    def __post_init__(self):
+        if self.reserved is None:
+            self.reserved = [0] * 5
+
+    def to_bytes(self) -> bytes:
+        body = b""
+        body += struct.pack("<B", self.mode)
+        body += struct.pack("<H", self.period)
+        body += struct.pack("<H", self.fs)
+        body += struct.pack("<B", self.batch_len)
+        # Add 5 reserved bytes
+        for i in range(5):
+            body += struct.pack("<B", self.reserved[i] if i < len(self.reserved) else 0)
+        # Add 1 padding byte to make it 12 bytes total
+        body += struct.pack("<B", 0)
+        return body
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) < 12:
+            raise ValueError(f"PPG config data too short: {len(data)} bytes, expected 12")
+        mode = data[0]
+        period = struct.unpack("<H", data[1:3])[0]
+        fs = struct.unpack("<H", data[3:5])[0]
+        batch_len = data[5]
+        reserved = list(data[6:11])
+        return cls(mode, period, fs, batch_len, reserved)
+
+
+@dataclass
 class Request:
     cmd: Command
     has_res: bool
-    body: bytes | None = None
+    body: Optional[bytes] = None
 
 
 class ResponseCode(IntEnum):
@@ -385,100 +445,96 @@ class GForce:
         isUniversalStream: bool,
         event_loop: asyncio.AbstractEventLoop,
         gforce_event_loop: asyncio.AbstractEventLoop,
-    ) -> None:
-        self.device_name: str = ""
-        self.client: BleakClient | None = None
-        self.event_loop: asyncio.AbstractEventLoop = event_loop
-        self.gforce_event_loop: asyncio.AbstractEventLoop = gforce_event_loop
-        self.cmd_char: str = cmd_char
-        self.data_char: str = data_char
-        self.responses: dict[Command, Queue] = {}
-        self.resolution: SampleResolution = SampleResolution.BITS_8
-        self._num_channels: int = 8
-        self._device: BLEDevice = device
-        self._is_universal_stream: bool = isUniversalStream
-        self._raw_data_buf: queue.Queue[bytes] | None = None
-        self.packet_id: int = 0
-        self.data_packet: list = []
+        chip_type: BLEChipType = BLEChipType.Unknown,
+    ):
+        self.device_name = ""
+        self.client = None
+        self.event_loop = event_loop
+        self.gforce_event_loop = gforce_event_loop
+        self.cmd_char = cmd_char
+        self.data_char = data_char
+        self.responses: Dict[Command, queue.Queue] = {}
+        self.last_command_failure_time: Optional[float] = None
+        self.last_command_failure_cmd: Optional[int] = None
+        self.resolution = SampleResolution.BITS_8
+        self._num_channels = 8
+        self._device = device
+        self._is_universal_stream = isUniversalStream
+        self._chip_type = chip_type
+        self._raw_data_buf: queue.Queue[bytes] = None
+        self.packet_id = 0
+        self.data_packet = []
 
-    async def connect(
-        self,
-        disconnect_cb: Callable[..., None],
-        buf: queue.Queue[bytes],
-    ) -> None:
-        if platform.system() == "Darwin":
-            loop = asyncio.get_running_loop()
-            asyncio.set_event_loop(loop)
+    def get_chip_type(self) -> BLEChipType:
+        return self._chip_type
+
+    async def _run_in_gforce_loop(self, coro, timeout=None):
+
+        if asyncio.get_running_loop() == self.gforce_event_loop:
+            if timeout is not None:
+                return await asyncio.wait_for(coro, timeout=timeout)
+            return await coro
+        future = asyncio.run_coroutine_threadsafe(coro, self.gforce_event_loop)
+        if timeout is not None:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        return await asyncio.wrap_future(future)
+
+    async def connect(self, disconnect_cb, buf: queue.Queue[bytes]):
+        return await self._run_in_gforce_loop(self._do_connect(disconnect_cb, buf))
+
+    async def _do_connect(self, disconnect_cb, buf: queue.Queue[bytes]):
 
         client = BleakClient(self._device, disconnected_callback=disconnect_cb)
         self.client = client
         self.device_name = self._device.name
         self._raw_data_buf = buf
-
+        
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 await asyncio.wait_for(client.connect(), timeout=sensor_utils._TIMEOUT)
                 await asyncio.sleep(0.5)
-
+                
                 if client.is_connected:
                     break
             except Exception as e:
-                print(f"[ERROR] Connection attempt {attempt + 1} failed: {e}", flush=True)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1.0)
                 else:
-                    print("[ERROR] All connection attempts failed", flush=True)
-                    return
+                    raise ConnectionError("Connect %s fail: %s" % (self._device.name , e))
 
         if not client.is_connected:
-            return
+            raise TimeoutError("Connect timeout: " + self._device.name)
 
         try:
             if not self._is_universal_stream:
                 await asyncio.wait_for(
-                    client.start_notify(self.cmd_char, self._on_cmd_response), timeout=sensor_utils._TIMEOUT
+                    client.start_notify(self.cmd_char, self._on_cmd_response),
+                    timeout=sensor_utils._TIMEOUT
                 )
             else:
                 await asyncio.wait_for(
-                    client.start_notify(self.data_char, self._on_universal_response), timeout=sensor_utils._TIMEOUT
+                    client.start_notify(self.data_char, self._on_universal_response),
+                    timeout=sensor_utils._TIMEOUT
                 )
-
         except Exception as e:
-            print(f"[ERROR] Failed to start notifications: {e}", flush=True)
             await client.disconnect()
-            return
+            raise ConnectionError("Connect %s fail: %s" % (self._device.name , e))
 
-    def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray) -> None:
-        # bs = bytes(bs)
-
-        # full_packet = []
-
-        # is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
-        # if is_partial_data:
-        #     packet_id = bs[1]
-        #     if self.packet_id != 0 and self.packet_id != packet_id + 1:
-        #         raise Exception(
-        #             "Unexpected packet id: expected {} got {}".format(
-        #                 self.packet_id + 1,
-        #                 packet_id,
-        #             )
-        #         )
-        #     elif self.packet_id == 0 or self.packet_id > packet_id:
-        #         self.packet_id = packet_id
-        #         self.data_packet += bs[2:]
-
-        #         if self.packet_id == 0:
-        #             full_packet = self.data_packet
-        #             self.data_packet = []
-        # else:
-        #     full_packet = bs
-
-        full_packet = bs
-        if len(full_packet) == 0:
-            return
-
-        q.put_nowait(bytes(full_packet))
+    def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray):
+        try:
+            q.put_nowait(bytes(bs))
+        except queue.Full:
+            # Drop only a few oldest items instead of clearing the whole queue
+            # to avoid losing too many raw data packets at once.
+            SdkLog.w(_TAG, "Raw data queue full, dropping oldest packets")
+            dropped = 0
+            while dropped < 16 and not q.empty():
+                try:
+                    q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
 
     @staticmethod
     def _convert_acceleration_to_g(data: bytes) -> np.ndarray[np.float32]:
@@ -509,6 +565,7 @@ class GForce:
 
     @staticmethod
     def _convert_euler(data: bytes) -> np.ndarray[np.float32]:
+
         euler_data = np.frombuffer(data, dtype=np.float32).astype(np.float32)
         num_channels = 3
 
@@ -516,6 +573,7 @@ class GForce:
 
     @staticmethod
     def _convert_quaternion(data: bytes) -> np.ndarray[np.float32]:
+
         quaternion_data = np.frombuffer(data, dtype=np.float32).astype(np.float32)
         num_channels = 4
 
@@ -523,6 +581,7 @@ class GForce:
 
     @staticmethod
     def _convert_rotation_matrix(data: bytes) -> np.ndarray[np.float32]:
+
         rotation_matrix_data = np.frombuffer(data, dtype=np.int32).astype(np.float32)
         num_channels = 9
 
@@ -530,18 +589,31 @@ class GForce:
 
     @staticmethod
     def _convert_emg_gesture(data: bytes) -> np.ndarray[np.float16]:
+
         emg_gesture_data = np.frombuffer(data, dtype=np.int16).astype(np.float16)
         num_channels = 6
 
         return emg_gesture_data.reshape(-1, num_channels)
 
-    def _on_universal_response(self, _: BleakGATTCharacteristic, bs: bytearray) -> None:
-        self._raw_data_buf.put_nowait(bytes(bs))
+    def _on_universal_response(self, _: BleakGATTCharacteristic, bs: bytearray):
+        q = self._raw_data_buf
+        try:
+            q.put_nowait(bytes(bs))
+        except queue.Full:
+            # Drop only a few oldest items instead of clearing the whole queue.
+            SdkLog.w(_TAG, "Universal raw data queue full, dropping oldest packets")
+            dropped = 0
+            while dropped < 16 and not q.empty():
+                try:
+                    q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
 
-    def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray) -> None:
+    def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray):
         sensor_utils.async_exec(self.async_on_cmd_response(bs), self.event_loop)
 
-    async def async_on_cmd_response(self, bs: bytearray) -> None:
+    async def async_on_cmd_response(self, bs: bytearray):
         try:
             # print(bytes(bs))
             response = self._parse_response(bytes(bs))
@@ -549,8 +621,6 @@ class GForce:
                 self.responses[response.cmd].put_nowait(
                     response.data,
                 )
-            else:
-                print("invalid response:" + bytes(bs))
         except Exception as e:
             raise Exception("Failed to parse response: %s" % e)
 
@@ -613,7 +683,13 @@ class GForce:
                 has_res=True,
             )
         )
-        return buf.decode("utf-8")
+        # 硬件版本定义：temp[2]=SYS_HARDWARE_REV_ADDR, temp[3]=SYS_HARDWARE_TYPE_ADDR
+        # 响应数据中前两个字节分别为硬件版本号和硬件类型
+        if len(buf) >= 2:
+            return f"{buf[0]}.{buf[1]}"
+        if len(buf) == 1:
+            return str(buf[0])
+        return "0"
 
     async def get_model_number(self) -> str:
         buf = await self._send_request(
@@ -660,6 +736,8 @@ class GForce:
                 has_res=True,
             )
         )
+        if buf is None or len(buf) == 0:
+            return -1
         return int.from_bytes(buf, byteorder="big")
 
     async def get_temperature(self) -> int:
@@ -669,6 +747,8 @@ class GForce:
                 has_res=True,
             )
         )
+        if buf is None or len(buf) == 0:
+            return -1
         return int.from_bytes(buf, byteorder="big")
 
     async def power_off(self) -> None:
@@ -679,7 +759,7 @@ class GForce:
             )
         )
 
-    async def system_reset(self) -> None:
+    async def system_reset(self):
         await self._send_request(
             Request(
                 cmd=Command.SYSTEM_RESET,
@@ -697,6 +777,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_motor")
 
     async def set_led(self, switchStatus):
         body = [switchStatus == True]
@@ -708,6 +789,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_led")
 
     async def set_package_id(self, switchStatus):
         body = [switchStatus == True]
@@ -719,6 +801,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_package_id")
 
     async def set_log_level(self, logLevel):
         body = [0xFF & logLevel]
@@ -730,8 +813,9 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_log_level")
 
-    async def set_function_switch(self, funcSwitch) -> bool:
+    async def set_function_switch(self, funcSwitch):
         body = [0xFF & funcSwitch]
         body = bytes(body)
         ret = await self._send_request(
@@ -741,11 +825,9 @@ class GForce:
                 has_res=True,
             )
         )
-        if len(ret) > 0 and ret[0] == 0:
-            return True
-        return False
+        return self._check_set_response(ret, "set_function_switch")
 
-    async def set_neucir_app_control(self, open, close, stop) -> bool:
+    async def set_neucir_app_control(self, open, close, stop):
         if stop:
             body = [4]
         elif open:
@@ -761,11 +843,9 @@ class GForce:
                 has_res=True,
             )
         )
-        if len(ret) > 0 and ret[0] == 0:
-            return True
-        return False
+        return self._check_set_response(ret, "set_neucir_app_control")
 
-    async def set_neucir_mode(self, mode) -> bool:
+    async def set_neucir_mode(self, mode):
         body = [0x90]
 
         body = bytes(body)
@@ -776,14 +856,13 @@ class GForce:
                 has_res=True,
             )
         )
-        if len(ret) > 0 and ret[0] == 0:
-            return True
-        return False
-
+        return self._check_set_response(ret, "set_neucir_mode")
+    
     async def set_firmware_filter_switch(self, switchStatus: int):
         body = [0xFF & switchStatus]
         body = bytes(body)
-        await self._send_request(Request(cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH, body=body, has_res=True))
+        ret = await self._send_request(Request(cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH, body=body, has_res=True))
+        return self._check_set_response(ret, "set_firmware_filter_switch")
 
     async def get_firmware_filter_switch(self):
         buf = await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
@@ -800,6 +879,7 @@ class GForce:
         )
 
         # print('set_emg_raw_data_config returned:', ret)
+        return self._check_set_response(ret, "set_emg_raw_data_config")
 
         self.resolution = cfg.resolution
 
@@ -849,6 +929,26 @@ class GForce:
         )
         return EcgRawDataConfig.from_bytes(buf)
 
+    async def get_ppg_raw_data_config(self) -> PpgRawDataConfig:
+        buf = await self._send_request(
+            Request(
+                cmd=Command.CMD_GET_PPG_CONFIG,
+                has_res=True,
+            )
+        )
+        return PpgRawDataConfig.from_bytes(buf)
+
+    async def set_ppg_raw_data_config(self, cfg: PpgRawDataConfig):
+        body = cfg.to_bytes()
+        ret = await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_PPG_CONFIG,
+                body=body,
+                has_res=True,
+            )
+        )
+        return self._check_set_response(ret, "set_ppg_raw_data_config")
+
     async def get_imu_raw_data_config(self) -> ImuRawDataConfig:
         buf = await self._send_request(
             Request(
@@ -857,6 +957,43 @@ class GForce:
             )
         )
         return ImuRawDataConfig.from_bytes(buf)
+
+    async def set_imu_raw_data_config(self, cfg: ImuRawDataConfig):
+        body = cfg.to_bytes()
+        ret = await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_IMU_CONFIG,
+                body=body,
+                has_res=True,
+            )
+        )
+        return self._check_set_response(ret, "set_imu_raw_data_config")
+
+    async def get_imu_cap_data_config(self) -> Optional[tuple]:
+        """
+        Get IMU capability configuration.
+        
+        Returns:
+            Optional[tuple]: (channel_mask, samp_rate, sample_count) if successful, None otherwise
+        """
+        buf = await self._send_request(
+            Request(
+                cmd=Command.CMD_GET_IMU_CAP,
+                has_res=True,
+            )
+        )
+        
+        if buf is None or len(buf) < 7:
+            return None
+        
+        # Parse the response: 4 bytes channel_mask + 2 bytes samp_rate + 1 byte sample_count
+        channel_mask = struct.unpack("<I", buf[0:4])[0]  # unsigned int (4 bytes)
+        samp_rate = struct.unpack("<H", buf[4:6])[0]     # unsigned short (2 bytes)
+        sample_count = struct.unpack("<B", buf[6:7])[0]  # unsigned byte (1 byte)
+        
+        # Check if IMU_TYPE_QAT6 is supported
+
+        return (channel_mask, samp_rate, sample_count)
 
     async def get_brth_raw_data_config(self) -> BrthRawDataConfig:
         buf = await self._send_request(
@@ -867,7 +1004,7 @@ class GForce:
         )
         return BrthRawDataConfig.from_bytes(buf)
 
-    async def set_subscription(self, subscription: DataSubscription) -> None:
+    async def set_subscription(self, subscription: DataSubscription):
         body = [
             0xFF & subscription,
             0xFF & (subscription >> 8),
@@ -875,85 +1012,102 @@ class GForce:
             0xFF & (subscription >> 24),
         ]
         body = bytes(body)
-        await self._send_request(
+        ret = await self._send_request(
             Request(
                 cmd=Command.SET_DATA_NOTIF_SWITCH,
                 body=body,
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_subscription")
 
-    async def start_streaming(self, q: queue.Queue[bytes]) -> None:
+    def _check_set_response(self, ret: Optional[bytes], name: str) -> bytes:
+        # """检查 set_xxxx 命令的响应，失败时抛出 RuntimeError。"""
+        # if ret is None:
+        #     raise RuntimeError(f"{name} failed: no response")
+        # if len(ret) == 0:
+        #     raise RuntimeError(f"{name} failed: empty response")
+        # if ret[0] != 0:
+        #     raise RuntimeError(f"{name} failed: error code {ret[0]}")
+        return ret
+
+    async def start_streaming(self, q: queue.Queue):
+        return await self._run_in_gforce_loop(self._do_start_streaming(q))
+
+    async def _do_start_streaming(self, q: queue.Queue):
         await asyncio.wait_for(
             self.client.start_notify(
                 self.data_char,
                 lambda _, data: self._on_data_response(q, data),
             ),
-            timeout=sensor_utils._TIMEOUT,
+            timeout=sensor_utils._TIMEOUT
         )
 
-    async def stop_streaming(self) -> None:
+    async def stop_streaming(self):
+        return await self._run_in_gforce_loop(self._do_stop_streaming())
+
+    async def _do_stop_streaming(self):
         try:
             await asyncio.wait_for(self.client.stop_notify(self.data_char), timeout=sensor_utils._TIMEOUT)
         except Exception as e:
-            print(f"Failed to stop streaming: {e}")
+            raise RuntimeError("Stop streaming %s fail: %s" % (self._device.name , e))
 
-    async def disconnect(self) -> None:
+    async def disconnect(self):
+        return await self._run_in_gforce_loop(self._do_disconnect())
+
+    async def _do_disconnect(self):
         with suppress(asyncio.CancelledError):
             try:
                 if self.client:
                     await asyncio.wait_for(self.client.disconnect(), timeout=sensor_utils._TIMEOUT)
             except Exception as e:
-                print(f"Disconnect error: {e}")
+                raise RuntimeError("Disconnect %s fail: %s" % (self._device.name , e))
 
-    def _get_response_channel(self, cmd: Command) -> Queue:
+    def _get_response_channel(self, cmd: Command) -> queue.Queue:
         if self.responses.get(cmd) != None:
             return self.responses[cmd]
         else:
-            q = Queue()
+            q = queue.Queue()
             self.responses[cmd] = q
             return q
 
-    async def _send_request(self, req: Request) -> bytes | None:
+    async def _send_request(self, req: Request) -> Optional[bytes]:
         return await self._send_request_internal(req=req)
 
-    async def _send_request_internal(self, req: Request) -> bytes | None:
+    async def _send_request_internal(self, req: Request) -> Optional[bytes]:
         q = None
         if req.has_res:
             q = self._get_response_channel(req.cmd)
-
-        timeStamp_old = -1
-        while not q.empty():
-            timeStamp_old = q.get_nowait()
-
-        now = datetime.now()
-        timestamp_now = now.timestamp()
-        if (timeStamp_old > -1) and ((timestamp_now - timeStamp_old) < 3):
-            print("send request too fast")
-            q.put_nowait(timeStamp_old)
-            return None
+            # 清空可能残留的旧响应，避免拿到上次超时的数据
+            while not q.empty():
+                q.get_nowait()
 
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
 
         # print(str(req.cmd) + str(req.body))
+        response = False if self._chip_type == BLEChipType.RFSTAR else None
         try:
-            await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), timeout=1)
-        except Exception:
-            self.responses[req.cmd] = None
+            await self._run_in_gforce_loop(
+                self.client.write_gatt_char(self.cmd_char, bs, response=response),
+                timeout=2
+            )
+        except Exception as e:
+            self.last_command_failure_time = time.time()
+            self.last_command_failure_cmd = req.cmd
+            SdkLog.exception(_TAG, f"_send_request write_gatt_char failed: {req.cmd}")
+            if req.has_res:
+                self.responses[req.cmd] = None
             return None
 
         if not req.has_res:
-            self.responses[req.cmd] = None
             return None
 
         try:
-            ret = await asyncio.wait_for(q.get(), 2)
-            now = datetime.now()
-            timestamp_now = now.timestamp()
-            q.put_nowait(timestamp_now)
+            ret = q.get(timeout=2)
             return ret
-        except Exception:
+        except Exception as e:
+            SdkLog.exception(_TAG, f"_send_request wait response failed: {req.cmd}")
             self.responses[req.cmd] = None
-            return None
+            raise RuntimeError(f"_send_request wait response failed: {req.cmd}") from e

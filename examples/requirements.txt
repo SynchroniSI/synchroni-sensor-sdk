@@ -1,4 +1,4 @@
 synchroni-sensor-sdk
-PyQt5
+scipy
 matplotlib
-scipy==1.11.4
+PyQt5

@@ -1,100 +1,241 @@
 from enum import IntEnum
+from typing import List
+
+import flatbuffers
 
 
-# 一个采样数据 / A single sample datum.
-# 该类用于存储单个采样数据的相关信息，包括数据值、阻抗、饱和度、采样索引和是否丢包的标志
-# This class holds one sample: value, impedance, saturation, sample index, and packet-loss flag.
 class Sample:
-    # """
-    # Initialize a Sample instance.
-    # :param data: 数据值，单位为 uV / Sample value in uV
-    # :param impedance: 阻抗值，单位为 Ω / Impedance in Ω
-    # :param saturation: 饱和度值，单位为 % ，值 0-100 / Saturation in %, 0-100
-    # :param sample_index: 采样索引，用于标识采样的顺序 / Sample index for ordering
-    # :param is_lost: 是否丢包的标志，True 表示丢包，False 表示正常 / True if packet lost, False otherwise
-    # """
-    # def __init__(self, data: int, impedance: int, saturation: int, sample_index: int, is_lost: bool):
-    #     self.data = data
-    #     self.impedance = impedance
-    #     self.saturation = saturation
-    #     self.sampleIndex = sample_index
-    #     self.isLost = is_lost
+    __slots__ = [
+        "rawData",
+        "data",
+        "impedance",
+        "saturation",
+        "sampleIndex",
+        "isLost",
+        "timeStampInMs",
+        "channelIndex",
+    ]
 
-    def __init__(self) -> None:
-        self.rawData: int = 0
-        self.data: int = 0
-        self.impedance: int = 0
-        self.saturation: float = 0.0
-        self.sampleIndex: int = 0
-        self.isLost: bool = False
-        self.timeStampInMs: int = 0
-        self.channelIndex: int = 0
+    def __init__(self):
+        self.rawData = 0
+        self.data = 0.0
+        self.impedance = 0.0
+        self.saturation = 0.0
+        self.sampleIndex = 0
+        self.isLost = False
+        self.timeStampInMs = 0
+        self.channelIndex = 0
+
+    def reset(self):
+        self.rawData = 0
+        self.data = 0.0
+        self.impedance = 0.0
+        self.saturation = 0.0
+        self.sampleIndex = 0
+        self.isLost = False
+        self.timeStampInMs = 0
+        self.channelIndex = 0
 
 
-# 对应 DataType 枚举 / DataType enum.
-# 该枚举类定义了不同类型的数据，用于区分传感器采集的不同类型的数据
-# Enum of sensor data types (acceleration, gyro, EMG, EEG, ECG, impedance, etc.).
 class DataType(IntEnum):
-    NTF_ACC = 0x1  # 加速度 / Accelerometer
-    NTF_GYRO = 0x2  # 陀螺仪 / Gyroscope
-    NTF_EMG = 0x8  # EMG，肌电 / EMG (electromyography)
-    NTF_MAG_ANGLE_DATA = 0x0D  # NeuCir 角度值百分比 0%-100% / NeuCir angle 0–100%
-    NTF_EEG = 0x10  # EEG，脑电 / EEG (electroencephalography)
-    NTF_ECG = 0x11  # ECG，心电 / ECG (electrocardiography)
-    NTF_IMPEDANCE = 0x12  # 阻抗数据 / Impedance
-    NTF_IMU = 0x13  # 包含 ACC 和 GYRO / IMU (ACC + gyro)
-    NTF_ADS = 0x14  # 无单位 ads 数据 / Unitless ADS data
-    NTF_BRTH = 0x15  # 呼吸 / Breathing
-    NTF_IMPEDANCE_EXT = 0x16  # 阻抗数据扩展 / Extended impedance
-    NTF_DATA_TYPE_MAX = 0x17
+    NTF_ACC = 0x1
+    NTF_GYRO = 0x2
+    NTF_EULER_DATA = 0x4
+    NTF_QUATERNION = 0x5
+    NTF_GEST = 0x07
+    NTF_EMG = 0x8
+    NTF_MAG_ANGLE_DATA = 0x0D
+    NTF_EEG = 0x10
+    NTF_ECG = 0x11
+    NTF_IMPEDANCE = 0x12
+    NTF_IMU = 0x13
+    NTF_ADS = 0x14
+    NTF_BRTH = 0x15
+    NTF_IMPEDANCE_EXT = 0x16
+    NTF_SPO2 = 0x17
+    NTF_PPG = 0x18
 
 
-# 一次采样的数据，包含多个通道；channel_samples 为二维数组（通道索引 × 采样索引）
-# One packet of sampled data for multiple channels; channel_samples is [channel][sample].
-# 该类用于存储一次采样的完整数据，包括设备 MAC、数据类型、采样率、通道数等
-# Holds one sample packet: device MAC, data type, sample rate, channel count, and channel samples.
 class SensorData:
-    # """
-    # Initialize a SensorData instance.
+    __slots__ = [
+        "deviceMac",
+        "dataType",
+        "sampleRate",
+        "channelCount",
+        "packageSampleCount",
+        "packageIndexLength",
+        "channelSamples",
+        "lastPackageCounter",
+        "lastPackageIndex",
+        "lostPackageCount",
+        "resolutionBits",
+        "resolutionSigned",
+        "channelMask",
+        "minPackageSampleCount",
+        "K",
+    ]
 
-    # :param device_mac: The MAC address of the device.
-    # :param data_type: The type of data being collected.
-    # :param sample_rate: The rate at which samples are collected.
-    # :param channel_count: The number of channels in the data.
-    # :param package_sample_count: The number of samples in the package.
-    # :param channel_samples: A list of lists containing the sample data for each channel.
-    # """
-    # def __init__(self, device_mac: str, data_type: DataType, sample_rate: int, channel_count: int,
-    #              package_sample_count: int, channel_samples: List[List[Sample]]):
-    #     self.deviceMac = device_mac
-    #     self.dataType = data_type
-    #     self.sampleRate = sample_rate
-    #     self.channelCount = channel_count
-    #     self.packageSampleCount = package_sample_count
-    #     self.channelSamples = channel_samples
-    #     self.lastPackageCounter = 0
-    #     self.lastPackageIndex = 0
-    #     self.resolutionBits = 0
-    #     self.channelMask = 0
-    #     self.minPackageSampleCount = 0
-    #     self.K = 0
+    def __init__(self):
+        self.deviceMac = ""
+        self.dataType = DataType.NTF_EEG
+        self.sampleRate = 0.0
+        self.channelCount = 0
+        self.packageSampleCount = 0
+        self.packageIndexLength = 2
+        self.channelSamples: List[List[Sample]] = list()
+        self.lastPackageCounter = 0
+        self.lastPackageIndex = 0
+        self.lostPackageCount = 0
+        self.resolutionBits = 0
+        self.resolutionSigned = 0
+        self.channelMask = 0
+        self.minPackageSampleCount = 0
+        self.K = 0.0
 
-    def __init__(self) -> None:
-        self.deviceMac: str = ""
-        self.dataType: DataType = DataType.NTF_EEG
-        self.sampleRate: int = 0
-        self.channelCount: int = 0
-        self.packageSampleCount: int = 0
-        self.packageIndexLength: int = 2
-        self.channelSamples: list[list[Sample]] = list()
-        self.lastPackageCounter: int = 0
-        self.lastPackageIndex: int = 0
-        self.resolutionBits: int = 0
-        self.channelMask: int = 0
-        self.minPackageSampleCount: int = 0
-        self.K: float = 0.0
+    def reset(self):
+        self.deviceMac = ""
+        self.dataType = DataType.NTF_EEG
+        self.sampleRate = 0.0
+        self.channelCount = 0
+        self.packageSampleCount = 0
+        self.packageIndexLength = 2
+        self.channelSamples.clear()
+        self.lastPackageCounter = 0
+        self.lastPackageIndex = 0
+        self.lostPackageCount = 0
+        self.resolutionBits = 0
+        self.resolutionSigned = 0
+        self.channelMask = 0
+        self.minPackageSampleCount = 0
+        self.K = 0.0
 
-    def clear(self) -> None:
+    def clear(self):
         self.channelSamples.clear()
         self.lastPackageCounter = -1
         self.lastPackageIndex = 0
+        self.lostPackageCount = 0
+
+    def to_flatbuffers(self) -> bytes:
+        """将 SensorData 序列化为 FlatBuffers bytes。"""
+        import sensor.fb.SensorData as FBSensorData
+        import sensor.fb.Sample as FBSample
+
+        builder = flatbuffers.Builder(1024)
+
+        # 扁平化 channelSamples
+        flat_samples = []
+        samples_per_channel = []
+        for channel in self.channelSamples:
+            samples_per_channel.append(len(channel))
+            for sample in channel:
+                flat_samples.append(sample)
+
+        # samples 向量（struct 数组）
+        samples_offset = 0
+        if flat_samples:
+            FBSensorData.StartSamplesVector(builder, len(flat_samples))
+            for sample in reversed(flat_samples):
+                FBSample.CreateSample(
+                    builder,
+                    int(sample.timeStampInMs),
+                    int(sample.channelIndex),
+                    int(sample.sampleIndex),
+                    int(sample.rawData),
+                    float(sample.data),
+                    float(sample.impedance),
+                    float(sample.saturation),
+                    bool(sample.isLost),
+                )
+            samples_offset = builder.EndVector()
+
+        # samples_per_channel 向量
+        spc_offset = 0
+        if samples_per_channel:
+            FBSensorData.StartSamplesPerChannelVector(builder, len(samples_per_channel))
+            for count in reversed(samples_per_channel):
+                builder.PrependInt32(count)
+            spc_offset = builder.EndVector()
+
+        # device_mac 字符串
+        mac_offset = builder.CreateString(self.deviceMac) if self.deviceMac else 0
+
+        FBSensorData.Start(builder)
+        if mac_offset:
+            FBSensorData.AddDeviceMac(builder, mac_offset)
+        FBSensorData.AddDataType(builder, int(self.dataType))
+        FBSensorData.AddLastPackageCounter(builder, int(self.lastPackageCounter))
+        FBSensorData.AddLastPackageIndex(builder, int(self.lastPackageIndex))
+        FBSensorData.AddLostPackageCount(builder, int(self.lostPackageCount))
+        FBSensorData.AddResolutionBits(builder, int(self.resolutionBits))
+        FBSensorData.AddResolutionSigned(builder, int(self.resolutionSigned))
+        FBSensorData.AddSampleRate(builder, float(self.sampleRate))
+        FBSensorData.AddChannelCount(builder, int(self.channelCount))
+        FBSensorData.AddChannelMask(builder, int(self.channelMask))
+        FBSensorData.AddMinPackageSampleCount(builder, int(self.minPackageSampleCount))
+        FBSensorData.AddPackageSampleCount(builder, int(self.packageSampleCount))
+        FBSensorData.AddPackageIndexLength(builder, int(self.packageIndexLength))
+        FBSensorData.AddK(builder, float(self.K))
+        if samples_offset:
+            FBSensorData.AddSamples(builder, samples_offset)
+        if spc_offset:
+            FBSensorData.AddSamplesPerChannel(builder, spc_offset)
+        root = FBSensorData.End(builder)
+
+        builder.Finish(root)
+        return bytes(builder.Output())
+
+    @classmethod
+    def from_flatbuffers(cls, buf: bytes) -> "SensorData":
+        """从 FlatBuffers bytes 反序列化为 SensorData。"""
+        return cls.from_flatbuffers_pooled(buf, cls())
+
+    @classmethod
+    def from_flatbuffers_pooled(cls, buf: bytes, data: "SensorData", pool=None) -> "SensorData":
+        """从 FlatBuffers bytes 反序列化到传入的 SensorData 实例（对象池复用）。"""
+        import sensor.fb.SensorData as FBSensorData
+
+        data.reset()
+        fb = FBSensorData.SensorData.GetRootAs(buf, 0)
+
+        mac = fb.DeviceMac()
+        data.deviceMac = mac.decode('utf-8') if isinstance(mac, bytes) else (mac or "")
+        data.dataType = DataType(fb.DataType())
+        data.lastPackageCounter = fb.LastPackageCounter()
+        data.lastPackageIndex = fb.LastPackageIndex()
+        data.lostPackageCount = fb.LostPackageCount()
+        data.resolutionBits = fb.ResolutionBits()
+        data.resolutionSigned = fb.ResolutionSigned()
+        data.sampleRate = fb.SampleRate()
+        data.channelCount = fb.ChannelCount()
+        data.channelMask = fb.ChannelMask()
+        data.minPackageSampleCount = fb.MinPackageSampleCount()
+        data.packageSampleCount = fb.PackageSampleCount()
+        data.packageIndexLength = fb.PackageIndexLength()
+        data.K = fb.K()
+
+        data.channelSamples.clear()
+        samples_len = fb.SamplesLength()
+        spc_len = fb.SamplesPerChannelLength()
+
+        offset = 0
+        for i in range(spc_len):
+            count = fb.SamplesPerChannel(i)
+            channel = []
+            for j in range(count):
+                if offset >= samples_len:
+                    break
+                fb_sample = fb.Samples(offset)
+                sample = pool.acquire_sample() if pool is not None else Sample()
+                sample.timeStampInMs = fb_sample.TimeStampInMs()
+                sample.channelIndex = fb_sample.ChannelIndex()
+                sample.sampleIndex = fb_sample.SampleIndex()
+                sample.rawData = fb_sample.RawData()
+                sample.data = fb_sample.Data()
+                sample.impedance = fb_sample.Impedance()
+                sample.saturation = fb_sample.Saturation()
+                sample.isLost = fb_sample.IsLost()
+                channel.append(sample)
+                offset += 1
+            data.channelSamples.append(channel)
+
+        return data

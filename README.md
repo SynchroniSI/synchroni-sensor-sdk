@@ -196,6 +196,8 @@ success = sensor_profile.connect()
 
 ### Disconnect
 
+If data notification is currently active, `disconnect()` will automatically stop it first before closing the BLE connection.
+
 ```python
 success = sensor_profile.disconnect()
 ```
@@ -330,15 +332,27 @@ battery_power = sensor_profile.getBatteryLevel()
 
 ### setParam
 
-Use `setParam(key: str, value: str) -> str` when the device is `Ready`. Returns `"OK"` on success.
+### Async methods
+
+all methods start with async is async methods, they has same params and return result as sync methods.
+
+Please check async_console.py in examples directory
+
+### setParam method
+
+Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor profile. Please call after device in 'Ready' state.
+
+The asynchronous variant is `asyncSetParam(self, key: str, value: str) -> str`.
+
+If the device is already streaming when you change an `NTF_*` or `FILTER_*` key, the SDK will stop and restart the data notification so the new setting takes effect immediately.
+
+Below is available key and value:
 
 ```python
-sensor_profile.setParam("NTF_EMG", "ON")        # ON or OFF
-sensor_profile.setParam("NTF_EEG", "ON")        # ON or OFF
-sensor_profile.setParam("NTF_ECG", "ON")        # ON or OFF
-sensor_profile.setParam("NTF_IMU", "ON")        # ON or OFF
-sensor_profile.setParam("NTF_BRTH", "ON")       # ON or OFF
-sensor_profile.setParam("NTF_IMPEDANCE", "ON")  # ON or OFF
+# Data stream toggles
+result = sensorProfile.setParam("NTF_GEST", "ON")
+result = sensorProfile.setParam("NTF_EMG", "ON")
+# set EMG data to ON or OFF, result is "OK" if succeed
 
 sensor_profile.setParam("FILTER_50HZ", "ON")    # 50 Hz notch filter
 sensor_profile.setParam("FILTER_60HZ", "ON")    # 60 Hz notch filter
@@ -347,49 +361,47 @@ sensor_profile.setParam("FILTER_LPF", "ON")     # 80 Hz low-pass filter
 
 sensor_profile.setParam("DEBUG_BLE_DATA_PATH", "/absolute/path/to/debug.csv")
 
-# NeuCir-specific
-sensor_profile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
-sensor_profile.setParam("NEUCIR_APP_CONTROL", "OPEN")   # OPEN, CLOSE, or STOP
+result = sensorProfile.setParam("NTF_IMU", "ON")
+# set IMU data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("NTF_BRTH", "ON")
+# set BRTH data to ON or OFF, result is "OK" if succeed
+
+# Firmware filter toggles
+result = sensorProfile.setParam("FILTER_50HZ", "ON")
+# set 50Hz notch filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_60HZ", "ON")
+# set 60Hz notch filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_HPF", "ON")
+# set 0.5Hz hpf filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_LPF", "ON")
+# set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
+# set debug ble data path, result is "OK" if succeed
+# please give an absolute path and make sure it is valid and writeable by yourself
 ```
 
-## Async methods
 
-Methods prefixed with `async` are coroutine equivalents of their sync counterparts:
+### getParam method
 
-| Sync | Async |
-|------|-------|
-| `scan()` | `asyncScan()` |
-| `connect()` | `asyncConnect()` |
-| `disconnect()` | `asyncDisconnect()` |
-| `init()` | `asyncInit()` |
-| `getBatteryLevel()` | `asyncGetBatteryLevel()` |
-| `startDataNotification()` | `asyncStartDataNotification()` |
-| `stopDataNotification()` | `asyncStopDataNotification()` |
-| `setParam()` | `asyncSetParam()` |
+Use `def getParam(self, key: str) -> str` to query the current parameter state of a sensor profile. Please call after the device reaches the 'Ready' state.
 
-See `examples/async_console.py` for usage.
+The asynchronous variant is `asyncGetParam(self, key: str) -> str`.
 
-## Exceptions
+Supported aggregate query keys:
 
-The SDK raises typed exceptions (exported from `sensor`) for error conditions:
+```python
+result = sensorProfile.getParam("FILTER")
+# Returns a pipe-separated string of all filter states, e.g.:
+# "FILTER_50HZ|ON|FILTER_60HZ|ON|FILTER_HPF|ON|FILTER_LPF|ON"
 
-| Exception | Description |
-|-----------|-------------|
-| `SensorError` | Base class for all SDK errors |
-| `SensorTerminatedError` | SDK has been terminated |
-| `SensorNotConnectedError` | Device is not connected |
-| `SensorNotReadyError` | Device is not in `Ready` state |
-| `SensorNotInitializedError` | `init()` has not been called |
-| `InvalidDeviceServiceError` | Unsupported device service UUID |
-| `DataNotificationInProgressError` | Start/stop notification already in progress |
-| `StartDataNotificationError` | Failed to start data notification |
-| `StopDataNotificationError` | Failed to stop data notification |
-| `DataContextInitInProgressError` | Initialization already in progress |
-| `DataContextInitError` | Data context initialization failed |
-| `DataContextStopStreamingError` | Failed to stop streaming |
-| `DataContextNotTransferringError` | Operation requires active streaming |
-| `DataContextReadSamplesError` | Error reading or processing samples |
+result = sensorProfile.getParam("NTF")
+# Returns a pipe-separated string of all notification states, e.g.:
+# "NTF_BRTH|ON|NTF_ECG|ON|NTF_EEG|ON|NTF_EMG|ON|..."
+```
 
-## License
-
-MIT — see [LICENSE.txt](LICENSE.txt).
+If the key is not supported, the result starts with `"Error"`.

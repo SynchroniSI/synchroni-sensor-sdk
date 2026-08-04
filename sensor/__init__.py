@@ -1,42 +1,30 @@
-from .exceptions import (
-    DataContextInitError,
-    DataContextInitInProgressError,
-    DataContextNotTransferringError,
-    DataContextReadSamplesError,
-    DataContextStopStreamingError,
-    DataNotificationInProgressError,
-    InvalidDeviceServiceError,
-    SensorError,
-    SensorNotConnectedError,
-    SensorNotInitializedError,
-    SensorNotReadyError,
-    SensorTerminatedError,
-    StartDataNotificationError,
-    StopDataNotificationError,
-)
-from .sensor_controller import *
-from .sensor_data import *
-from .sensor_device import *
-from .sensor_profile import *
+from sensor.sensor_controller import SensorController, SensorControllerInstance
+from sensor.sensor_profile import SensorProfile
+from sensor.sensor_device import BLEDevice, DeviceInfo, DeviceStateEx
+from sensor.sensor_data import DataType, Sample, SensorData
+from sensor.winrt_high_throughput import apply as _apply_winrt_high_throughput_patch
+from sensor.bleak_no_ack_patch import apply as _apply_bleak_no_ack_patch
+import os
+
+# SDK 版本号（单一数据源，setup.py 打包时从这里读取）
+__version__ = "1.2.6"
+
+# Windows 下尝试给 bleak WinRT backend 打高吞吐率连接参数补丁
+_apply_winrt_high_throughput_patch()
+
+# 如果设置了环境变量 SENSOR_SDK_FORCE_NO_ACK=1，则对命令特征强制 write-without-response
+if os.environ.get("SENSOR_SDK_FORCE_NO_ACK", "0") == "1":
+    _apply_bleak_no_ack_patch()
 
 __all__ = [
-    "DataContextInitError",
-    "DataContextInitInProgressError",
-    "DataContextNotTransferringError",
-    "DataContextReadSamplesError",
-    "DataContextStopStreamingError",
-    "DataNotificationInProgressError",
-    "InvalidDeviceServiceError",
-    "SensorError",
-    "SensorNotConnectedError",
-    "SensorNotInitializedError",
-    "SensorNotReadyError",
-    "SensorTerminatedError",
-    "StartDataNotificationError",
-    "StopDataNotificationError",
     "SensorController",
-    "SensorData",
-    "SensorDevice",
+    "SensorControllerInstance",
     "SensorProfile",
-    "SensorUtils",
+    "BLEDevice",
+    "DeviceInfo",
+    "DeviceStateEx",
+    "DataType",
+    "Sample",
+    "SensorData",
+    "__version__",
 ]

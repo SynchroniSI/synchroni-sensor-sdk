@@ -1,14 +1,21 @@
+from typing import Any
+
 import asyncio
 import threading
 import time
-from typing import Any
 
-_terminated: bool = False
-_TIMEOUT: int = 10
-running_tasks: set = set()
-_runloop: asyncio.AbstractEventLoop | None = None
-_event_thread: threading.Thread | None = None
-_needCloseRunloop: bool = False
+from sensor.sdk_log import SdkLog
+
+_TAG = "sensor_utils"
+
+_terminated = False
+_TIMEOUT = 10
+BLEAK_RESULT_QUEUE_MAXSIZE = 2000
+BLEAK_DATA_QUEUE_MAXSIZE = 2000
+running_tasks = set()
+_runloop: asyncio.AbstractEventLoop = None
+_event_thread: threading.Thread = None
+_needCloseRunloop = False
 
 
 def checkRunLoop() -> None:
@@ -29,18 +36,35 @@ def checkRunLoop() -> None:
 def Terminate() -> None:
     global _runloop, _needCloseRunloop, _event_thread, _terminated
     _terminated = True
-    try:
-        for task in asyncio.all_tasks():
-            task.cancel()
-    except Exception:
-        pass
 
-    if _needCloseRunloop:
+    # 如果不是我们创建的 loop（例如用户自己的 qasync/Qt loop），不要动它
+    if not _needCloseRunloop or _runloop is None:
+        return
+
+    def _cancel_tasks():
         try:
-            _runloop.stop()
-            _runloop.close()
+            # 在 loop 线程内部调用，有运行中的事件循环
+            for task in asyncio.all_tasks():
+                if not task.done():
+                    task.cancel()
         except Exception:
+            # 取消任务失败时不阻塞终止流程
             pass
+
+    try:
+        # 取消 / stop 都必须在 loop 所在线程执行，避免跨线程调用 asyncio API 抛异常
+        if _runloop.is_running():
+            _runloop.call_soon_threadsafe(_cancel_tasks)
+            time.sleep(0.2)
+            _runloop.call_soon_threadsafe(_runloop.stop)
+
+        if _event_thread is not None and _event_thread.is_alive():
+            _event_thread.join(timeout=3.0)
+
+        # 不再主动 close loop：Windows 的 ProactorEventLoop 在 still-running 时 close()
+        # 会抛 RuntimeError。守护线程会在 loop stop 后自然退出，进程退出时回收资源。
+    except Exception as e:
+        SdkLog.exception(_TAG, "Error during terminate")
 
 
 def async_exec(
@@ -56,8 +80,7 @@ def async_exec(
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"async_exec failed: {e}")
 
 
 def sync_call(
@@ -75,8 +98,7 @@ def sync_call(
         task.add_done_callback(lambda t: running_tasks.remove(t))
         return task.result(timeout=_timeout)
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"sync_call failed: {e}")
 
 
 async def async_call(
@@ -93,8 +115,7 @@ async def async_call(
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:
-        print(e)
-        pass
+        SdkLog.e(_TAG, f"async_call failed: {e}")
 
     while not _terminated and not task.done():
         await asyncio.sleep(0.1)
@@ -103,8 +124,8 @@ async def async_call(
         if not task.cancelled():
             return task.result()
     except Exception as e:
-        print(e)
-        raise
+        SdkLog.e(_TAG, f"async_call result failed: {e}")
+        return
 
 
 def start_loop(loop: asyncio.BaseEventLoop) -> None:

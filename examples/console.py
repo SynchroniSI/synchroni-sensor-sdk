@@ -103,10 +103,6 @@ def onDataCallback(sensor: SensorProfile, data: SensorData):
 
 def onPowerChanged(sensor: SensorProfile, power: int):
     print("connected sensor: " + sensor.BLEDevice.Name + " power: " + str(power))
-    if not sensor.isDataTransfering:
-        sensor.disconnect()
-        time.sleep(2)
-        SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
 
 
 def onStateChanged(sensor: SensorProfile, newstate: DeviceStateEx):

@@ -43,3 +43,10 @@ songs/
 # Dist
 dist/
 build/
+/sensor_sdk.egg-info/
+/allure-report/
+/.pytest_cache/
+/allure-results/
+.idea/
+sensor/fb/__pycache__/
+/synchroni_sensor_sdk.egg-info/

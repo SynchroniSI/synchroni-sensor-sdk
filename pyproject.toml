@@ -1,6 +1,6 @@
 [project]
 name = "synchroni-sensor-sdk"
-version = "2.0.0"
+version = "2.0.1"
 description = "SDK for interfacing with Synchroni BLE devices"
 url = "https://github.com/SynchroniSI/synchroni-sensor-sdk"
 authors = [

@@ -108,7 +108,7 @@ def test_known_vid_pid() -> None:
 def test_claim_allowlist_only_tplink() -> None:
     from synchroni_sensor_sdk.core.bluetooth import KNOWN_EEG_USB_DONGLES
 
-    assert KNOWN_EEG_USB_DONGLES == frozenset({("2357", "0604")})
+    assert frozenset({("2357", "0604")}) == KNOWN_EEG_USB_DONGLES
 
 
 def test_windows_claim_argument_list_quotes_spaces() -> None:
@@ -117,11 +117,9 @@ def test_windows_claim_argument_list_quotes_spaces() -> None:
         _windows_argument_list,
     )
 
-    cmdline = _windows_argument_list(
-        ["--type", "0", "--name", "Synchroni EEG Bluetooth Dongle VID_2357 PID_0604"]
-    )
-    assert cmdline.startswith("--type 0 --name \"")
-    assert "VID_2357 PID_0604\"" in cmdline
+    cmdline = _windows_argument_list(["--type", "0", "--name", "Synchroni EEG Bluetooth Dongle VID_2357 PID_0604"])
+    assert cmdline.startswith('--type 0 --name "')
+    assert 'VID_2357 PID_0604"' in cmdline
     assert "&" not in cmdline
     assert _normalize_exit_code(4294967293) == -3
     assert _normalize_exit_code(-3) == -3
@@ -158,9 +156,7 @@ def test_windows_adapter_id_encodes_ampersand() -> None:
     encoded = encode_windows_adapter_id_token(raw)
     assert "&" not in encoded
     assert "%26" in encoded
-    assert normalize_windows_adapter_id(f"system:windows:{raw}") == (
-        f"system:windows:{encoded}"
-    )
+    assert normalize_windows_adapter_id(f"system:windows:{raw}") == (f"system:windows:{encoded}")
 
 
 def test_managed_usb_transport_name() -> None:

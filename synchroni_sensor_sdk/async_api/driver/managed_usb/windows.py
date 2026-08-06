@@ -27,6 +27,22 @@ WINDOWS_OS_BLUETOOTH_SERVICES = {"bthenum", "bthmini", "bthport", "bthusb"}
 SYNCHRONI_WINUSB_DRIVER_NAME = "synchroni eeg bluetooth dongle"
 
 
+def encode_windows_adapter_id_token(instance_id: str) -> str:
+    """Encode a Windows PnP instance id for use in public adapter ids.
+
+    PnP instance ids contain ``&`` (``VID_xxxx&PID_yyyy``). Raw ``&`` breaks
+    ``cmd.exe`` / ``poetry run`` when users paste ids into a shell, so adapter
+    ids use ``%26`` instead. :attr:`BluetoothAdapter.device_instance_id` keeps
+    the original PnP string for Windows APIs.
+    """
+    return instance_id.lower().replace("&", "%26")
+
+
+def normalize_windows_adapter_id(adapter_id: str) -> str:
+    """Normalize adapter id spelling so raw ``&`` and ``%26`` compare equal."""
+    return adapter_id.strip().lower().replace("&", "%26")
+
+
 @dataclass(frozen=True)
 class WindowsPnpCandidate:
     instance_id: str
@@ -199,7 +215,7 @@ def windows_adapters_from_pnp_candidates(
             )
             adapters.append(
                 BluetoothAdapter(
-                    id=f"{MANAGED_USB_ADAPTER_ID_PREFIX}windows:{candidate.instance_id.lower()}",
+                    id=f"{MANAGED_USB_ADAPTER_ID_PREFIX}windows:{encode_windows_adapter_id_token(candidate.instance_id)}",
                     name=candidate.name,
                     source="managed_usb",
                     platform="windows",
@@ -222,7 +238,7 @@ def windows_adapters_from_pnp_candidates(
             claim_required = windows_row_requires_claim(candidate)
             adapters.append(
                 BluetoothAdapter(
-                    id=f"{WINDOWS_SYSTEM_ADAPTER_ID_PREFIX}{candidate.instance_id.lower()}",
+                    id=f"{WINDOWS_SYSTEM_ADAPTER_ID_PREFIX}{encode_windows_adapter_id_token(candidate.instance_id)}",
                     name=candidate.name,
                     source="system",
                     platform="windows",

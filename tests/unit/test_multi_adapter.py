@@ -98,11 +98,69 @@ class ManagedRadioStub:
 
 
 def test_known_vid_pid() -> None:
-    assert is_known_usb_bluetooth_adapter("0a12", "0001")
-    assert is_known_usb_bluetooth_adapter("10d7", "b012")
-    assert is_known_usb_bluetooth_adapter("33fa", "0010")  # UGREEN BT5.4
     assert is_known_usb_bluetooth_adapter("2357", "0604")  # TP-Link UB500
+    assert not is_known_usb_bluetooth_adapter("0a12", "0001")
+    assert not is_known_usb_bluetooth_adapter("10d7", "b012")
+    assert not is_known_usb_bluetooth_adapter("33fa", "0010")
     assert not is_known_usb_bluetooth_adapter("ffff", "ffff")
+
+
+def test_claim_allowlist_only_tplink() -> None:
+    from synchroni_sensor_sdk.core.bluetooth import KNOWN_EEG_USB_DONGLES
+
+    assert KNOWN_EEG_USB_DONGLES == frozenset({("2357", "0604")})
+
+
+def test_windows_claim_argument_list_quotes_spaces() -> None:
+    from synchroni_sensor_sdk.async_api.driver.managed_usb.windows_claim import (
+        _normalize_exit_code,
+        _windows_argument_list,
+    )
+
+    cmdline = _windows_argument_list(
+        ["--type", "0", "--name", "Synchroni EEG Bluetooth Dongle VID_2357 PID_0604"]
+    )
+    assert cmdline.startswith("--type 0 --name \"")
+    assert "VID_2357 PID_0604\"" in cmdline
+    assert "&" not in cmdline
+    assert _normalize_exit_code(4294967293) == -3
+    assert _normalize_exit_code(-3) == -3
+    assert _normalize_exit_code(0) == 0
+
+
+def test_windows_claim_runner_script_includes_dest_and_log() -> None:
+    from pathlib import Path
+
+    from synchroni_sensor_sdk.async_api.driver.managed_usb.windows_claim import (
+        _build_elevated_runner_script,
+        _subprocess_no_window_flags,
+    )
+
+    script = _build_elevated_runner_script(
+        installer=Path(r"C:\tools\winusb-installer.exe"),
+        helper_args=["--type", "0", "--vid", "0x2357", "--pid", "0x0604", "--dest", r"C:\tmp\drv"],
+        log_path=Path(r"C:\tmp\claim.log"),
+    )
+    assert "--dest" in script
+    assert r"C:\tmp\drv" in script
+    assert r"C:\tmp\claim.log" in script
+    assert "exit $code" in script
+    assert _subprocess_no_window_flags() in {0, 0x08000000}
+
+
+def test_windows_adapter_id_encodes_ampersand() -> None:
+    from synchroni_sensor_sdk.async_api.driver.managed_usb.windows import (
+        encode_windows_adapter_id_token,
+        normalize_windows_adapter_id,
+    )
+
+    raw = r"USB\VID_33FA&PID_0010\9&1F0DFEBA&0&4"
+    encoded = encode_windows_adapter_id_token(raw)
+    assert "&" not in encoded
+    assert "%26" in encoded
+    assert normalize_windows_adapter_id(f"system:windows:{raw}") == (
+        f"system:windows:{encoded}"
+    )
 
 
 def test_managed_usb_transport_name() -> None:

@@ -97,12 +97,13 @@ def test_download_tries_mirrors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_get(url: str) -> bytes:
         attempts.append(url)
-        if "git.kernel.org" in url:
+        if "gitlab.com" in url:
             raise RuntimeError("HTTP 503")
         return b"OK"
 
     monkeypatch.setattr(rtk_fw, "_http_get_url", fake_get)
     data = rtk_fw._http_get_with_mirrors("rtl8761bu_fw.bin")  # noqa: SLF001
     assert data == b"OK"
+    assert any("gitlab.com" in u for u in attempts)
     assert any("git.kernel.org" in u for u in attempts)
-    assert any("linuxfromscratch" in u or "anduin" in u for u in attempts)
+    assert attempts[0].startswith("https://gitlab.com/")

@@ -79,9 +79,12 @@ class MultiAdapterController:
 
     def get_adapter(self, adapter_id: str) -> BluetoothAdapter:
         adapter = self._adapters.get(adapter_id)
-        if adapter is None:
-            raise BluetoothAdapterNotFoundError(f"Adapter {adapter_id!r} is not in inventory.")
-        return adapter
+        if adapter is not None:
+            return adapter
+        alias = self._find_adapter_alias(adapter_id)
+        if alias is not None:
+            return alias
+        raise BluetoothAdapterNotFoundError(f"Adapter {adapter_id!r} is not in inventory.")
 
     def free_managed_adapter_ids(self) -> list[str]:
         """Managed USB adapters that are ready for scan/connect (not reserved/occupied)."""
@@ -174,11 +177,18 @@ class MultiAdapterController:
         raise BluetoothAdapterNotFoundError(f"Adapter {adapter_id!r} is not in inventory.")
 
     def _find_adapter_alias(self, adapter_id: str) -> BluetoothAdapter | None:
+        from synchroni_sensor_sdk.async_api.driver.managed_usb.windows import (
+            normalize_windows_adapter_id,
+        )
+
         needle = adapter_id.strip().lower()
         if not needle:
             return None
+        needle_norm = normalize_windows_adapter_id(needle)
         for adapter in self._adapters.values():
             if adapter.id.lower() == needle:
+                return adapter
+            if normalize_windows_adapter_id(adapter.id) == needle_norm:
                 return adapter
             if adapter.usb_transport and adapter.usb_transport.lower() in needle:
                 return adapter

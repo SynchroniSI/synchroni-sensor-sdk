@@ -111,10 +111,10 @@ on Windows, but managed USB HCI raises `ManagedUsbUnavailableError`.
 | Platform | Notes |
 |----------|--------|
 | **macOS** | Plug in a known USB dongle; inventory uses libusb + `system_profiler` merge. No admin WinUSB step. Consumer Realtek dongles (e.g. TP-Link UB500) may need host firmware (auto-fetched when enabled). |
-| **Windows** | Known EEG VID/PID devices bound to a non-WinUSB driver show `claim_required=True`. Run `claim_adapter` once (UAC), replug if inventory does not flip to `managed_usb`. |
+| **Windows** | Known EEG VID/PID devices bound to a non-WinUSB driver show `claim_required=True`. Run `claim_adapter` once (UAC), replug if inventory does not flip to `managed_usb`. Adapter ids encode PnP ``&`` as ``%26`` so they survive `cmd.exe` / `poetry run` when pasted into a shell. |
 | **Linux** | Managed inventory via libusb when Bumble is installed; udev permissions must allow userspace access to the dongle. |
 
-Known USB Bluetooth inventory VID/PIDs (not an exhaustive product catalog) include CSR `0a12:0001`, Actions EEG `10d7:b012`, UGREEN BT5.4 `33fa:0010`, TP-Link UB500 `2357:0604`. Windows **claim allowlist** is a smaller EEG-focused subset (`KNOWN_EEG_USB_DONGLES`).
+Known USB Bluetooth inventory / Windows claim allowlist is currently limited to TP-Link UB500 `2357:0604` (`KNOWN_USB_BLUETOOTH_VID_PID` / `KNOWN_EEG_USB_DONGLES`).
 
 #### Workflow A — System BLE only
 

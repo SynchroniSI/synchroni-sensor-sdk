@@ -4,8 +4,9 @@ Bumble's RTK driver needs host-side firmware such as ``rtl8761bu_fw.bin`` (TP-Li
 UB500). This module downloads **only** the image set for the USB device in use
 (from VID/PID), not the full Bumble RTK catalog.
 
-Mirror sources (in order): Linux kernel firmware git, Linux from Scratch mirror,
-Realtek Android open-source tree. Retries 5xx failures.
+Mirror sources (in order): GitLab linux-firmware mirror, Linux kernel firmware
+git, Linux from Scratch mirror, Realtek Android open-source tree. Retries 5xx
+failures.
 
 Disable with env ``SYNCHRONI_RTK_FIRMWARE_AUTO=0``.
 """
@@ -78,6 +79,12 @@ class _Source:
 
 
 _SOURCES: tuple[_Source, ...] = (
+    # Prefer mirrors that validate with common Python CA bundles (Scoop/embeddable
+    # OpenSSL on Windows often rejects git.kernel.org's chain as "certificate expired").
+    _Source(
+        "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/rtl_bt",
+        False,
+    ),
     _Source(
         "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/rtl_bt",
         False,

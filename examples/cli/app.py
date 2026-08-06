@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 
 from synchroni_sensor_sdk import SYSTEM_DEFAULT_ADAPTER_ID, SensorHub
+from synchroni_sensor_sdk.core.exceptions import ClaimFailedError
 
 from cli import display as cli_display
 from cli.sample_session import run_collect_session, run_connect_session
@@ -16,6 +17,38 @@ app = typer.Typer(
     help="Basic Synchroni sensor SDK CLI for manual testing.",
     no_args_is_help=True,
 )
+
+
+def _claim_windows_adapter(hub: SensorHub, adapter_id: str | None) -> None:
+    """On Windows, claim the selected adapter when it requires WinUSB binding."""
+    if not adapter_id or adapter_id == SYSTEM_DEFAULT_ADAPTER_ID:
+        return
+    if not hub.get_bluetooth_capability().supports_windows_claim:
+        return
+
+    from synchroni_sensor_sdk.async_api.driver.managed_usb.windows import (
+        normalize_windows_adapter_id,
+    )
+
+    needle = normalize_windows_adapter_id(adapter_id)
+    adapter = next(
+        (a for a in hub.list_bluetooth_adapters() if normalize_windows_adapter_id(a.id) == needle),
+        None,
+    )
+    if adapter is None or not adapter.claim_required:
+        return
+
+    label = adapter.name or adapter.id
+    cli_display.console.print(f"Claiming [cyan]{adapter.id}[/cyan] ({label}) for managed USB…")
+    try:
+        result = hub.claim_adapter(adapter.id)
+    except ClaimFailedError as exc:
+        cli_display.console.print(f"  [red]{exc}[/red]")
+        return
+    style = "green" if result.success else "red"
+    cli_display.console.print(f"  [{style}]{result.message}[/{style}]")
+    if result.log_path:
+        cli_display.console.print(f"  log: [dim]{result.log_path}[/dim]")
 
 
 @app.command("list-adapters")
@@ -48,6 +81,7 @@ def scan(
 ) -> None:
     """Scan for nearby Synchroni sensors."""
     with SensorHub(enable_multi_adapter=True) as hub:
+        _claim_windows_adapter(hub, adapter_id)
         radio = adapter_id or SYSTEM_DEFAULT_ADAPTER_ID
         cli_display.console.print(
             f"Scanning for [bold]{timeout_ms}[/bold] ms (adapter=[cyan]{radio}[/cyan])…"
@@ -84,6 +118,7 @@ def connect(
 ) -> None:
     """Scan on an adapter, connect to the first device, stream briefly, print stats."""
     with SensorHub(enable_multi_adapter=True) as hub:
+        _claim_windows_adapter(hub, adapter_id)
         code = run_connect_session(
             hub,
             adapter_id=adapter_id,
@@ -125,6 +160,7 @@ def collect(
 ) -> None:
     """Scan, connect, stream for an interval, and write samples to a CSV file."""
     with SensorHub(enable_multi_adapter=True) as hub:
+        _claim_windows_adapter(hub, adapter_id)
         code = run_collect_session(
             hub,
             adapter_id=adapter_id,

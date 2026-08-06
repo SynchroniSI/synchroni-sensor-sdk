@@ -22,8 +22,7 @@ WINDOWS_CLAIM_ACTION_WINUSB = "windows_winusb_install"
 # Known EEG USB dongle VID:PID pairs that the SDK will help claim for WinUSB.
 KNOWN_EEG_USB_DONGLES: frozenset[tuple[str, str]] = frozenset(
     {
-        ("0a12", "0001"),  # Cambridge Silicon Radio CSR8510 A10
-        ("10d7", "b012"),  # Actions "general adapter" / dedicated EEG dongles
+        ("2357", "0604"),  # TP-Link UB500 Adapter
     }
 )
 

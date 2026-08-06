@@ -21,9 +21,6 @@ USB_BLUETOOTH_ADAPTER_NAME_RE = re.compile(
 USB_USERSPACE_DRIVER_RE = re.compile(r"\b(winusb|libusb|libusbk|libusb0)\b", re.IGNORECASE)
 KNOWN_USB_BLUETOOTH_VID_PID = frozenset(
     {
-        ("0a12", "0001"),  # Cambridge Silicon Radio CSR8510
-        ("10d7", "b012"),  # Actions "general adapter" / dedicated EEG dongles
-        ("33fa", "0010"),  # UGREEN BT5.4 Adapter
         ("2357", "0604"),  # TP-Link UB500 Adapter
     }
 )

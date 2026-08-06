@@ -207,6 +207,9 @@ class GForceDriver(Driver):
 
             await self._cancel_background_tasks()
 
+            if self._protocol is not None:
+                self._protocol.clear_pending_responses()
+
             if call_protocol_disconnect and self._protocol is not None:
                 try:
                     await self._protocol.disconnect()
@@ -320,6 +323,10 @@ class GForceDriver(Driver):
         """
         if self._data_context is None:
             raise SensorNotReadyError("Cannot init: device is not connected.")
+        # Recorder-equivalent: clear stale opcode waiters before probing device info
+        # so a prior timed-out command cannot return into the new init sequence.
+        if self._protocol is not None:
+            self._protocol.clear_pending_responses()
         self._power_interval_ms = power_refresh_interval
         await self._data_context.init(package_sample_count)
         self._inited = True

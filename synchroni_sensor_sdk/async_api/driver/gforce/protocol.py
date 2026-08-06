@@ -2,10 +2,10 @@ import asyncio
 import logging
 import platform
 import struct
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
 from enum import IntEnum
 from typing import Any, Protocol, Self, cast, runtime_checkable
 
@@ -18,6 +18,13 @@ from bleak import (
 )
 
 from synchroni_sensor_sdk.async_api.driver.gforce.crc_utils import BLE_TIMEOUT
+
+# Minimum gap between any successive protocol commands (WRITE + optional notify).
+COMMAND_MIN_INTERVAL_S = 0.075
+# Same-opcode cool-down: replaces the old "timestamp in response queue" / skip-if-too-fast rule.
+SAME_OPCODE_COOLDOWN_S = 3.0
+# Extra cool-down for firmware filter set/get (recorder RESPONSE_REUSE_GUARD ~3.05s).
+FILTER_CMD_COOLDOWN_S = 3.05
 
 
 @runtime_checkable
@@ -141,6 +148,15 @@ class Command(IntEnum):
     CMD_GET_FRIMWARE_FILTER_SWITCH = (0xA9,)
     # Partial command packet, format: [CMD_PARTIAL_DATA, packet number in reverse order, packet content]
     MD_PARTIAL_DATA = 0xFF
+
+
+# Firmware filter family — needs longer cool-down than generic set_param writes.
+FILTER_COMMANDS: frozenset[Command] = frozenset(
+    {
+        Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
+        Command.CMD_GET_FRIMWARE_FILTER_SWITCH,
+    }
+)
 
 
 class DataSubscription(IntEnum):
@@ -481,7 +497,8 @@ class GForceProtocol:
         self._loop: asyncio.AbstractEventLoop = loop
         self.cmd_char: str = cmd_char
         self.data_char: str = data_char
-        self.responses: dict[Command, asyncio.Queue[bytes | float] | None] = {}
+        # Opcode → payload queue. ``None`` is a cancel/sentinel (clear pending).
+        self.responses: dict[Command, asyncio.Queue[bytes | None] | None] = {}
         self.resolution: SampleResolution = SampleResolution.BITS_8
         self._num_channels: int = 8
         self._device: BLEDevice = device
@@ -491,6 +508,11 @@ class GForceProtocol:
         self.data_packet: list = []
         self._managed_usb_transport = managed_usb_transport
         self._managed_usb_peer_address = managed_usb_peer_address
+        # Serialise command exchanges and enforce cool-downs (replaces queue timestamps).
+        self._cmd_lock = asyncio.Lock()
+        self._last_any_cmd_end_mono: float = 0.0
+        self._last_cmd_end_mono: dict[Command, float] = {}
+        self._last_filter_cmd_end_mono: float = 0.0
 
     def _schedule_cmd_response(self, bs: bytes) -> None:
         asyncio.create_task(self.async_on_cmd_response(bs))
@@ -510,6 +532,9 @@ class GForceProtocol:
         disconnect_cb: Callable[..., None],
         buf: asyncio.Queue[bytes],
     ) -> None:
+        # Fresh session: never inherit opcode maps or cool-downs from a prior connection.
+        self.clear_pending_responses()
+        self._reset_command_pacing()
         if platform.system() == "Darwin":
             loop = asyncio.get_running_loop()
             asyncio.set_event_loop(loop)
@@ -1135,6 +1160,9 @@ class GForceProtocol:
             self._logger.warning("Failed to stop streaming: %s", e)
 
     async def disconnect(self) -> None:
+        # Drop any pending opcode waiters before tearing down the link so a later
+        # reconnect/init cannot observe stale response queues.
+        self.clear_pending_responses()
         with suppress(asyncio.CancelledError):
             try:
                 if self.client:
@@ -1142,64 +1170,117 @@ class GForceProtocol:
             except Exception as e:
                 self._logger.warning("Disconnect error: %s", e)
 
-    def _get_response_channel(self, cmd: Command) -> asyncio.Queue[bytes | float]:
+    def _get_response_channel(self, cmd: Command) -> asyncio.Queue[bytes | None]:
         existing = self.responses.get(cmd)
         if existing is not None:
             return existing
-        q: asyncio.Queue[bytes | float] = asyncio.Queue()
+        q: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.responses[cmd] = q
         return q
 
+    @staticmethod
+    def _unblock_response_queue(q: asyncio.Queue[bytes | None]) -> None:
+        """Wake waiters blocked on ``q.get()`` with a cancel sentinel (``None``)."""
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        with suppress(Exception):
+            q.put_nowait(None)
+
     def _clear_response_channel(self, cmd: Command) -> None:
-        self.responses.pop(cmd, None)
+        q = self.responses.pop(cmd, None)
+        if q is not None:
+            self._unblock_response_queue(q)
+
+    def clear_pending_responses(self) -> None:
+        """Discard all in-flight command channels and wake any waiters.
+
+        Call before :meth:`init` / reconnect and on disconnect so a timed-out or
+        abandoned wait cannot poison the next command exchange.
+        """
+        channels = [q for q in self.responses.values() if q is not None]
+        self.responses.clear()
+        for q in channels:
+            self._unblock_response_queue(q)
+
+    async def _await_command_cooldown(self, cmd: Command) -> None:
+        """Sleep until min-interval / same-opcode / filter cool-downs have elapsed."""
+        now = time.monotonic()
+        deadlines = [
+            self._last_any_cmd_end_mono + COMMAND_MIN_INTERVAL_S,
+            self._last_cmd_end_mono.get(cmd, 0.0) + SAME_OPCODE_COOLDOWN_S,
+        ]
+        if cmd in FILTER_COMMANDS:
+            deadlines.append(self._last_filter_cmd_end_mono + FILTER_CMD_COOLDOWN_S)
+        delay = max(0.0, max(deadlines) - now)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _record_command_complete(self, cmd: Command) -> None:
+        now = time.monotonic()
+        self._last_any_cmd_end_mono = now
+        self._last_cmd_end_mono[cmd] = now
+        if cmd in FILTER_COMMANDS:
+            self._last_filter_cmd_end_mono = now
+
+    def _reset_command_pacing(self) -> None:
+        """Reset cool-down clocks on connect so a new session is not delayed."""
+        self._last_any_cmd_end_mono = 0.0
+        self._last_cmd_end_mono.clear()
+        self._last_filter_cmd_end_mono = 0.0
 
     async def _send_request(self, req: Request) -> bytes | None:
         return await self._send_request_internal(req=req)
 
     async def _send_request_internal(self, req: Request) -> bytes | None:
-        q: asyncio.Queue[bytes | float] | None = None
-        if req.has_res:
-            q = self._get_response_channel(req.cmd)
+        """Send one protocol command under the serial lock with cool-downs.
 
-        time_stamp_old = -1.0
-        if q is not None:
-            while not q.empty():
-                item = q.get_nowait()
-                if isinstance(item, float):
-                    time_stamp_old = item
+        Commands never stamp timestamps into the response queue. In-flight
+        exchanges are exclusive via ``_cmd_lock``; cool-downs wait rather than
+        drop the request.
+        """
+        async with self._cmd_lock:
+            await self._await_command_cooldown(req.cmd)
 
-        now = datetime.now()
-        timestamp_now = now.timestamp()
-        if (time_stamp_old > -1) and ((timestamp_now - time_stamp_old) < 3):
-            self._logger.warning("Send request too fast")
-            if q is not None:
-                q.put_nowait(time_stamp_old)
-            return None
+            q: asyncio.Queue[bytes | None] | None = None
+            if req.has_res:
+                # Fresh channel for this exchange (any prior waiters were clear-ed).
+                self._clear_response_channel(req.cmd)
+                q = self._get_response_channel(req.cmd)
+                # Drain leftover (should be empty); keep only a clean receive buffer.
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
-        bs = bytes([req.cmd])
-        if req.body is not None:
-            bs += req.body
+            bs = bytes([req.cmd])
+            if req.body is not None:
+                bs += req.body
 
-        # print(str(req.cmd) + str(req.body))
-        try:
-            await asyncio.wait_for(self._require_client().write_gatt_char(self.cmd_char, bs), timeout=1)
-        except Exception:
-            self._clear_response_channel(req.cmd)
-            return None
+            try:
+                await asyncio.wait_for(self._require_client().write_gatt_char(self.cmd_char, bs), timeout=1)
+            except Exception:
+                if req.has_res:
+                    self._clear_response_channel(req.cmd)
+                self._record_command_complete(req.cmd)
+                return None
 
-        if not req.has_res:
-            self._clear_response_channel(req.cmd)
-            return None
+            if not req.has_res:
+                self._clear_response_channel(req.cmd)
+                self._record_command_complete(req.cmd)
+                return None
 
-        assert q is not None
-        try:
-            ret = await asyncio.wait_for(q.get(), 2)
-            now = datetime.now()
-            timestamp_now = now.timestamp()
-            q.put_nowait(timestamp_now)
-            if isinstance(ret, bytes):
+            assert q is not None
+            try:
+                ret = await asyncio.wait_for(q.get(), 2)
+                self._record_command_complete(req.cmd)
+                if ret is None:
+                    return None
                 return ret
-            return None
-        except Exception:
-            self._clear_response_channel(req.cmd)
-            return None
+            except Exception:
+                self._clear_response_channel(req.cmd)
+                self._record_command_complete(req.cmd)
+                return None

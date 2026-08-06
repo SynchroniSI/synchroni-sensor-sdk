@@ -79,6 +79,7 @@ async def test_disconnect_awaits_background_tasks() -> None:
     driver._protocol = SimpleNamespace(
         client=SimpleNamespace(is_connected=True),
         disconnect=fake_protocol_disconnect,
+        clear_pending_responses=lambda: None,
     )
 
     await driver.disconnect()

@@ -1,7 +1,10 @@
 import signal
 import time
-from typing import List
-from sensor import *
+
+from sensor.sensor_controller import SensorControllerInstance
+from sensor.sensor_data import DataType, SensorData
+from sensor.sensor_device import BLEDevice, DeviceStateEx
+from sensor.sensor_profile import SensorProfile
 
 SCAN_DEVICE_PERIOD_IN_MS = 3000
 PACKAGE_COUNT = 10
@@ -28,7 +31,7 @@ def SimpleTest():
             sensor.disconnect()
 
 
-def deviceFoundCallback(deviceList: List[BLEDevice]):
+def deviceFoundCallback(deviceList: list[BLEDevice]):
     print("stop scan")
     SensorControllerInstance.stopScan()
 
@@ -38,7 +41,7 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
     )
     for device in filteredDevice:
         sensor = SensorControllerInstance.requireSensor(device)
-        if sensor == None:
+        if sensor is None:
             continue
 
         print("found: " + sensor.BLEDevice.Name)
@@ -67,7 +70,8 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
                 print("init device: " + sensor.BLEDevice.Name + " failed")
                 continue
             deviceInfo = sensor.getDeviceInfo()
-            print("deviceInfo: Model: " + str(deviceInfo.ModelName))
+            if deviceInfo is not None:
+                print("deviceInfo: Model: " + str(deviceInfo.ModelName))
 
         if sensor.hasInited:
             print("start data transfer")
@@ -78,27 +82,9 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
 
 
 def onDataCallback(sensor: SensorProfile, data: SensorData):
-    # if (
-    #     data.dataType == DataType.NTF_EEG
-    #     or data.dataType == DataType.NTF_ECG
-    #     or data.dataType == DataType.NTF_BRTH
-    #     or data.dataType == DataType.NTF_ACC
-    #     or data.dataType == DataType.NTF_GYRO
-    # ):
-    #     print(
-    #         "got data from sensor: "
-    #         + sensor.BLEDevice.Name
-    #         + " data type: "
-    #         + str(data.dataType)
-    #     )
-    #     print(str(data.channelSamples[0][0].sampleIndex))
-
-    # if data.channelSamples[0][0].sampleIndex == 50:
-    #     sensor.stopDataNotification()
-    if data.dataType == DataType.NTF_EEG:
+    if data.dataType == DataType.NTF_EEG and data.channelSamples:
         for sample in data.channelSamples[0]:
             print(sample.data)
-    pass
 
 
 def onPowerChanged(sensor: SensorProfile, power: int):
@@ -111,7 +97,6 @@ def onStateChanged(sensor: SensorProfile, newstate: DeviceStateEx):
 
 def onErrorCallback(sensor: SensorProfile, reason: str):
     print("device: " + sensor.BLEDevice.Name + reason)
-    pass
 
 
 def terminate():

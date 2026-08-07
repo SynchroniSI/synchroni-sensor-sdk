@@ -32,9 +32,10 @@ class Sensor:
     parsing and publishing cease before the outbound data buffer is closed.
     """
 
-    def __init__(self, address: str, driver: Driver) -> None:
+    def __init__(self, address: str, driver: Driver, *, adapter_id: str | None = None) -> None:
         self._address = address
         self._driver = driver
+        self._adapter_id = adapter_id
         self._data_callback_task: asyncio.Task[None] | None = None
         self._power_callback_task: asyncio.Task[None] | None = None
         self._state_callback_task: asyncio.Task[None] | None = None
@@ -47,6 +48,11 @@ class Sensor:
     @property
     def address(self) -> str:
         return self._address
+
+    @property
+    def adapter_id(self) -> str | None:
+        """Host radio used for this connection (``system:default`` or managed ``usb:…``)."""
+        return self._adapter_id
 
     def device_state(self) -> DeviceState:
         return self._driver.device_state()
@@ -68,11 +74,17 @@ class Sensor:
         return self._driver.dropped_data_packets
 
     @classmethod
-    async def create(cls, address: str, driver: Driver | None = None) -> Sensor:
+    async def create(
+        cls,
+        address: str,
+        driver: Driver | None = None,
+        *,
+        adapter_id: str | None = None,
+    ) -> Sensor:
         """Create a sensor and its protocol driver for *address*."""
         if driver is None:
             driver = driver_factory(address)
-        return cls(address, driver)
+        return cls(address, driver, adapter_id=adapter_id)
 
     async def connect(self) -> None:
         await self._driver.connect()

@@ -53,6 +53,27 @@ def _response_bytes(payload: bytes | None) -> bytes:
     return payload
 
 
+def _response_text(payload: bytes | None) -> str:
+    """Decode a C-string protocol payload (UTF-8, null-terminated)."""
+    return _response_bytes(payload).split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+
+
+def _response_hardware_revision(payload: bytes | None) -> str:
+    """Decode HW revision: firmware may send binary ``rev.type`` or a text string."""
+    buf = _response_bytes(payload)
+    if not buf:
+        return "0"
+    # Prefer printable ASCII text when the payload is clearly textual.
+    if all(32 <= b < 127 or b == 0 for b in buf) and any(32 <= b < 127 for b in buf):
+        text = buf.split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip()
+        if text:
+            return text
+    # Legacy binary layout: first two bytes are hardware version and type.
+    if len(buf) >= 2:
+        return f"{buf[0]}.{buf[1]}"
+    return str(buf[0])
+
+
 @dataclass
 class Characteristic:
     uuid: str
@@ -753,7 +774,7 @@ class GForceProtocol:
         )
 
     async def get_protocol_version(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_PROTOCOL_VERSION,
@@ -761,7 +782,6 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_feature_map(self) -> int:
         buf = _response_bytes(
@@ -775,7 +795,7 @@ class GForceProtocol:
         return int.from_bytes(buf, byteorder="little")  # TODO: check if this is correct
 
     async def get_device_name(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_DEVICE_NAME,
@@ -783,10 +803,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_firmware_revision(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_FW_REVISION,
@@ -794,10 +813,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_hardware_revision(self) -> str:
-        buf = _response_bytes(
+        return _response_hardware_revision(
             await self._send_request(
                 Request(
                     cmd=Command.GET_HW_REVISION,
@@ -805,10 +823,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_model_number(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_MODEL_NUMBER,
@@ -816,10 +833,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_serial_number(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_SERIAL_NUMBER,
@@ -827,10 +843,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_manufacturer_name(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_MANUFACTURER_NAME,
@@ -838,10 +853,9 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_bootloader_version(self) -> str:
-        buf = _response_bytes(
+        return _response_text(
             await self._send_request(
                 Request(
                     cmd=Command.GET_BOOTLOADER_VERSION,
@@ -849,7 +863,6 @@ class GForceProtocol:
                 )
             )
         )
-        return buf.decode("utf-8")
 
     async def get_battery_level(self) -> int:
         buf = _response_bytes(

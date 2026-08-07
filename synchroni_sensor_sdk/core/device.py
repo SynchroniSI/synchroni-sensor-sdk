@@ -28,6 +28,7 @@ class DeviceInfo:
     hardware_version: str
     firmware_version: str
     channel_counts: dict[str, int]
+    name: str = ""
     sample_rates: dict[str, int] = field(default_factory=dict)
     mtu_size: int = 0
 

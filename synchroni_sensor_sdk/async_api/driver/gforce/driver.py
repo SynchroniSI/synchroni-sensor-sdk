@@ -280,8 +280,10 @@ class GForceDriver(Driver):
         return self._protocol is not None and self._protocol.client is not None and self._protocol.client.is_connected
 
     async def device_info(self) -> DeviceInfo:
-        if self._data_context is None or self._data_context._device_info is None:
-            return DeviceInfo(model="", hardware_version="", firmware_version="", channel_counts={})
+        if self._data_context is None:
+            raise SensorNotReadyError("Cannot read device info: device is not connected.")
+        if self._data_context._device_info is None:
+            raise SensorNotInitializedError("Device info is available after sensor.init() completes successfully.")
         return parse_device_info_to_public(self._data_context._device_info)
 
     async def get_battery_level(self) -> int:

@@ -39,6 +39,7 @@ def test_set_param_command_fields() -> None:
 
 def test_parse_device_info_includes_rates_and_mtu() -> None:
     info = ParseDeviceInfo()
+    info.DeviceName = "SyncEEG-1"
     info.ModelName = "Test"
     info.HardwareVersion = "1"
     info.FirmwareVersion = "2"
@@ -48,11 +49,24 @@ def test_parse_device_info_includes_rates_and_mtu() -> None:
     info.PpgSampleRate = 50
     info.MTUSize = 247
     public = parse_device_info_to_public(info)
+    assert public.name == "SyncEEG-1"
+    assert public.model == "Test"
     assert public.channel_counts["eeg"] == 4
     assert public.sample_rates["eeg"] == 250
     assert public.channel_counts["ppg"] == 2
     assert public.sample_rates["ppg"] == 50
     assert public.mtu_size == 247
+
+
+def test_response_text_and_hardware_revision() -> None:
+    from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
+        _response_hardware_revision,
+        _response_text,
+    )
+
+    assert _response_text(b"SyncEEG\x00\x00") == "SyncEEG"
+    assert _response_hardware_revision(bytes([3, 1])) == "3.1"
+    assert _response_hardware_revision(b"1.2.0\x00") == "1.2.0"
 
 
 def test_ble_chip_type_values() -> None:

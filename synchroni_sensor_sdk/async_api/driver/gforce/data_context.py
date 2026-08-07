@@ -641,7 +641,7 @@ class DataContext:
             info.MTUSize = client.mtu_size
         else:
             info.MTUSize = 0
-        info.DeviceName = await self.gForce.get_device_name()
+        info.DeviceName = await self.gForce.get_device_name() or self.gForce.device_name or ""
         info.ModelName = await self.gForce.get_model_number()
         info.HardwareVersion = await self.gForce.get_hardware_revision()
         info.FirmwareVersion = await self.gForce.get_firmware_revision()

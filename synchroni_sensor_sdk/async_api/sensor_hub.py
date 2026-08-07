@@ -248,8 +248,9 @@ class SensorHub:
             Single radio. ``None`` / ``system:default`` uses Bleak. A ``usb:…``
             id requires multi-adapter mode.
         adapter_ids:
-            When non-empty (multi-adapter only), scan those managed adapters
-            concurrently. Overrides ``adapter_id`` for managed multi-scan.
+            When set (multi-adapter only), scan those radios concurrently.
+            Each id may be ``system:default`` or a managed ``usb:…`` adapter.
+            Overrides ``adapter_id``.
         """
         self._ensure_active()
         if not self._bluetooth_enabled:
@@ -257,7 +258,7 @@ class SensorHub:
 
         if adapter_ids is not None:
             self._require_multi()
-            return await self._scan_managed_radios(timeout_ms, adapter_ids=adapter_ids)
+            return await self._scan_radios(timeout_ms, adapter_ids=adapter_ids)
 
         aid = adapter_id
         if aid is None or aid == SYSTEM_DEFAULT_ADAPTER_ID:
@@ -265,7 +266,7 @@ class SensorHub:
             return [self._to_scan_result(hit, adapter_id=SYSTEM_DEFAULT_ADAPTER_ID) for hit in hits]
 
         self._require_multi()
-        return await self._scan_managed_radios(timeout_ms, adapter_ids=[aid])
+        return await self._scan_radios(timeout_ms, adapter_ids=[aid])
 
     async def scan_managed_usb(self, timeout_ms: int = 2000) -> list[ScanResult]:
         """Scan all free, ready managed USB dongles and return route-stamped results."""
@@ -273,9 +274,9 @@ class SensorHub:
         multi = self._require_multi()
         if not multi.list_cached_adapters():
             await multi.refresh_adapters()
-        return await self._scan_managed_radios(timeout_ms, adapter_ids=None)
+        return await self._scan_radios(timeout_ms, adapter_ids=None)
 
-    async def _scan_managed_radios(
+    async def _scan_radios(
         self,
         timeout_ms: int,
         *,

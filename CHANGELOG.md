@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.1.0...v2.1.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* raise exception if device_info unable to complete ([d7e452c](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/d7e452cc056b2bee0c04bbfb1fdc824f285a67b9))
+* raise exception if device_info unable to complete ([cf2a286](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/cf2a286b1adf485d17a320732abfcfcbc53d3b53))
+
 ## [2.1.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.0.2...v2.1.0) (2026-08-07)
 
 

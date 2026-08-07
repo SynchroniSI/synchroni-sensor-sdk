@@ -49,6 +49,7 @@ def parse_device_info_to_public(info: ParseDeviceInfo) -> DeviceInfo:
     _put_count(channel_counts, "gest", info.GestChannelCount)
 
     return DeviceInfo(
+        name=info.DeviceName,
         model=info.ModelName or info.DeviceName,
         hardware_version=info.HardwareVersion,
         firmware_version=info.FirmwareVersion,

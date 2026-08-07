@@ -27,6 +27,11 @@ class Sensor(SyncBridge):
     def address(self) -> str:
         return self._async.address
 
+    @property
+    def adapter_id(self) -> str | None:
+        """Host radio used for this connection (``system:default`` or managed ``usb:…``)."""
+        return self._async.adapter_id
+
     def device_state(self) -> DeviceState:
         return self._async.device_state()
 

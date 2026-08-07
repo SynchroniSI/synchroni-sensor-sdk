@@ -327,10 +327,14 @@ Includes `lost_package_count` (package-index gap accumulation) plus channel batc
 
 | Field | Type |
 |-------|------|
-| `model`, `hardware_version`, `firmware_version` | `str` |
+| `model`, `hardware_version`, `firmware_version`, `name` | `str` |
 | `channel_counts` | `dict[str, int]` (e.g. `eeg`, `ppg`, `gest`) |
 | `sample_rates` | `dict[str, int]` |
 | `mtu_size` | `int` |
+
+Populated after a successful ``sensor.init()``. Calling ``device_info()`` earlier
+raises ``SensorNotInitializedError``. Use ``sensor.address`` / ``sensor.adapter_id``
+for connection identity (not part of ``DeviceInfo``).
 
 ### `SetParamCommand` (optional fields; `None` = skip)
 

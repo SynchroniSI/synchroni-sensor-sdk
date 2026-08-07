@@ -382,7 +382,11 @@ class SensorHub:
             device=connection.device,
             advertisement_data=connection.advertisement_data,
         )
-        sensor = await Sensor.create(connection.mac_address, driver=driver)
+        sensor = await Sensor.create(
+            connection.mac_address,
+            driver=driver,
+            adapter_id=SYSTEM_DEFAULT_ADAPTER_ID,
+        )
         await sensor.connect()
         self._connected_sensors[address] = sensor
         self._sensor_adapters[address] = SYSTEM_DEFAULT_ADAPTER_ID
@@ -410,7 +414,7 @@ class SensorHub:
                 advertisement_data=connection.advertisement_data,
                 managed_usb=connection.managed_usb,
             )
-            sensor = await Sensor.create(address, driver=driver)
+            sensor = await Sensor.create(address, driver=driver, adapter_id=adapter_id)
             await sensor.connect()
             await multi.occupy(adapter_id, address)
             self._sensor_adapters[address] = adapter_id

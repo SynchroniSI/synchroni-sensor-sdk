@@ -153,4 +153,19 @@ async def test_registry_system_and_managed() -> None:
     assert radios[0].adapter_id == "usb:m"
     again = await reg2.get("usb:m")
     assert again is radios[0]
+
+    multi._adapters[SYSTEM_DEFAULT_ADAPTER_ID] = BluetoothAdapter(
+        id=SYSTEM_DEFAULT_ADAPTER_ID,
+        name="System Bluetooth",
+        source="system",
+        platform="test",
+        transport="os",
+        last_seen_at=datetime.now(UTC),
+    )
+    with patch.object(multi, "refresh_adapters", new=AsyncMock(return_value=list(multi._adapters.values()))):
+        mixed = await reg2.list_managed_for_scan(
+            ["usb:m", SYSTEM_DEFAULT_ADAPTER_ID, "usb:m", SYSTEM_DEFAULT_ADAPTER_ID]
+        )
+    assert [r.adapter_id for r in mixed] == ["usb:m", SYSTEM_DEFAULT_ADAPTER_ID]
+    assert mixed[1] is reg2.system()
     await reg2.close_all()

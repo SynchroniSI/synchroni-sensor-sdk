@@ -71,8 +71,13 @@ class RadioRegistry:
     async def list_managed_for_scan(
         self,
         adapter_ids: Sequence[str] | None = None,
-    ) -> list[ManagedUsbRadioAdapter]:
-        """Select managed radios eligible for a scan pass (after inventory refresh)."""
+    ) -> list[RadioAdapter]:
+        """Select radios eligible for a scan pass (after inventory refresh).
+
+        When **adapter_ids** is ``None``, returns only free managed USB radios
+        (``scan_managed_usb``). When a list is given, each id may be
+        ``system:default`` or a managed ``usb:…`` adapter.
+        """
         if self._multi is None:
             raise MultiAdapterDisabledError("Managed USB scan requires SensorHub(enable_multi_adapter=True).")
         multi = self._multi
@@ -82,7 +87,13 @@ class RadioRegistry:
             ids = multi.free_managed_adapter_ids()
         else:
             ids = []
+            seen: set[str] = set()
             for aid in adapter_ids:
+                if multi.is_system_adapter(aid):
+                    if SYSTEM_DEFAULT_ADAPTER_ID not in seen:
+                        ids.append(SYSTEM_DEFAULT_ADAPTER_ID)
+                        seen.add(SYSTEM_DEFAULT_ADAPTER_ID)
+                    continue
                 try:
                     adapter = multi.resolve_adapter(aid)
                 except BluetoothAdapterNotFoundError:
@@ -96,15 +107,20 @@ class RadioRegistry:
                 if adapter.claim_required:
                     logger.info("Skipping claim_required adapter %s during managed scan", adapter.id)
                     continue
-                if not adapter.usb_transport:
+                if adapter.source != "managed_usb" or not adapter.usb_transport:
+                    logger.warning(
+                        "Adapter %s is not a managed USB radio; skipping",
+                        adapter.id,
+                    )
+                    continue
+                if adapter.id in seen:
                     continue
                 ids.append(adapter.id)
+                seen.add(adapter.id)
 
-        radios: list[ManagedUsbRadioAdapter] = []
+        radios: list[RadioAdapter] = []
         for aid in ids:
-            radio = await self.get(aid)
-            assert isinstance(radio, ManagedUsbRadioAdapter)
-            radios.append(radio)
+            radios.append(await self.get(aid))
         return radios
 
     async def close_all(self) -> None:

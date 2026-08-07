@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.1.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.0.2...v2.1.0) (2026-08-07)
+
+
+### Features
+
+* add exceptions and static types ([6467154](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/646715490c1ce5cf45ee59b12cb7674ab1d581c5))
+* add exceptions and static types ([4a1f84e](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/4a1f84ed0c48abcfedcbbe9d912442262d8a2f91))
+* implement v2 improvements and comparison scripts ([65b96bf](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/65b96bff6acb8bb1d3b4a072fa453fc340fe835c))
+* Redesign API and support multi-adapter workflows ([222c908](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/222c9080ff660110e75f977dce23676573ca0e3f))
+
+
+### Bug Fixes
+
+* add entry for default adapter when doing multi adapter scan ([fcc6b2b](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/fcc6b2bb4668a5e1f5127ed04e1076c1800518bb))
+
 ## [1.2.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v1.1.0...v1.2.0) (2026-06-06)
 
 

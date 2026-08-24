@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.2.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.1.1...v2.2.0) (2026-08-24)
+
+
+### Features
+
+* add native device profiles and sampling modes ([451496a](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/451496a2dbb1e6c9313085fb06390dab8d8abc60))
+* add native device profiles and sampling modes ([82ddf51](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/82ddf513b72bd79486294ff704bbf70e01298a68))
+
+
+### Bug Fixes
+
+* preserve set-param positional compatibility ([713efae](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/713efae5d2aeaea9bd3b598a2c35dac77fdfbfe1))
+
 ## [2.1.1](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.1.0...v2.1.1) (2026-08-07)
 
 

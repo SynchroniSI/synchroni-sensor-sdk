@@ -7,7 +7,7 @@ this module collapses it into the slim public shape. See ``gforce.parsing_models
 from __future__ import annotations
 
 from synchroni_sensor_sdk.async_api.driver.gforce.parsing_models import ParseDeviceInfo
-from synchroni_sensor_sdk.core.device import DeviceInfo
+from synchroni_sensor_sdk.core.device import DeviceInfo, published_product_specification
 
 
 def _put_count(counts: dict[str, int], key: str, value: int) -> None:
@@ -20,7 +20,12 @@ def _put_rate(rates: dict[str, int], key: str, value: int) -> None:
         rates[key] = value
 
 
-def parse_device_info_to_public(info: ParseDeviceInfo) -> DeviceInfo:
+def parse_device_info_to_public(
+    info: ParseDeviceInfo,
+    *,
+    supported_streams: frozenset[str] = frozenset(),
+    supported_filters: frozenset[str] = frozenset(),
+) -> DeviceInfo:
     channel_counts: dict[str, int] = {}
     sample_rates: dict[str, int] = {}
 
@@ -56,4 +61,11 @@ def parse_device_info_to_public(info: ParseDeviceInfo) -> DeviceInfo:
         channel_counts=channel_counts,
         sample_rates=sample_rates,
         mtu_size=info.MTUSize,
+        supported_streams=supported_streams,
+        supported_filters=supported_filters,
+        product_specification=published_product_specification(
+            info.DeviceName,
+            info.ModelName,
+            eeg_channel_count=info.EegChannelCount,
+        ),
     )

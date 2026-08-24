@@ -381,9 +381,18 @@ class ManagedUsbBleClient:
         subscriber = self._notify_subscribers.pop(_normalize_uuid(char_specifier), None)
         await peer.unsubscribe(characteristic, subscriber)
 
-    async def write_gatt_char(self, char_specifier: str, data: bytes | bytearray, response: bool = False) -> None:
+    async def write_gatt_char(
+        self,
+        char_specifier: str,
+        data: bytes | bytearray,
+        response: bool | None = None,
+    ) -> None:
         peer = self._require_peer()
         characteristic = await self._get_characteristic(char_specifier)
+        if response is None:
+            from bumble.gatt import Characteristic
+
+            response = bool(characteristic.properties & Characteristic.Properties.WRITE)
         await peer.write_value(characteristic, bytes(data), with_response=response)
 
     def _on_disconnection(self, *_args: object) -> None:

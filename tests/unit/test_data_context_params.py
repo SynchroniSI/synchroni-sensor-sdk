@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from synchroni_sensor_sdk.async_api.driver.gforce.data_context import DataContext, FeatureMaps
+from synchroni_sensor_sdk.async_api.driver.gforce.parsing_models import DataType, SensorData
 from synchroni_sensor_sdk.async_api.driver.gforce.protocol import DataSubscription
 from synchroni_sensor_sdk.core.params import NtfParam, ParamToggle
 
@@ -53,3 +54,19 @@ def test_get_params_snapshot(ctx: DataContext) -> None:
     snap = ctx.get_params_snapshot()
     assert "NTF_EEG" in snap.ntf
     assert "FILTER_50HZ" in snap.filters
+
+
+def test_lossy_packet_index_rollover_is_accepted(ctx: DataContext) -> None:
+    data = SensorData()
+    data.dataType = DataType.NTF_EEG
+    data.packageIndexLength = 2
+    data.packageSampleCount = 1
+    data.lastPackageIndex = 65_530
+    data.lastPackageCounter = 20
+    ctx._is_data_transfering = True
+    ctx.readSamples = MagicMock()  # type: ignore[method-assign]
+
+    packet = bytes((int(DataType.NTF_EEG), 5, 0, 0))
+    assert ctx.checkReadSamples(packet, data, 3, 0) is True
+    assert data.lastPackageIndex == 5
+    assert data.lastPackageCounter == 31

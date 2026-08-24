@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 from synchroni_sensor_sdk.async_api.driver.gforce.device_info import parse_device_info_to_public
 from synchroni_sensor_sdk.async_api.driver.gforce.parsing_models import ParseDeviceInfo
 from synchroni_sensor_sdk.core import device as device_types
@@ -36,6 +38,16 @@ def test_set_param_command_fields() -> None:
     assert cmd.enable_ntf_gest is False
     assert cmd.enable_ntf_mag_angle is True
     assert cmd.enable_ntf_acc is True
+
+
+def test_set_param_command_preserves_legacy_positional_order() -> None:
+    assert [field.name for field in fields(SetParamCommand)][-5:] == [
+        "debug_ble_data_path",
+        "neucir_mode",
+        "neucir_app_control",
+        "eeg_sample_rate_hz",
+        "emg_sample_rate_hz",
+    ]
 
 
 def test_parse_device_info_includes_rates_and_mtu() -> None:

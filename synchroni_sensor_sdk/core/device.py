@@ -368,13 +368,14 @@ class SetParamCommand:
     enable_filter_hpf: bool | None = None
     enable_filter_lpf: bool | None = None
 
-    eeg_sample_rate_hz: int | None = None
-    emg_sample_rate_hz: int | None = None
-
     debug_ble_data_path: str | None = None
 
     neucir_mode: NeuCirMode | None = None
     neucir_app_control: NeuCirAppControl | None = None
+
+    # New fields stay at the end to preserve the legacy positional constructor.
+    eeg_sample_rate_hz: int | None = None
+    emg_sample_rate_hz: int | None = None
 
 
 class DeviceState(IntEnum):

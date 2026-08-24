@@ -24,6 +24,7 @@ from synchroni_sensor_sdk.core.device import (
     NeuCirAppControl,
     NeuCirMode,
     SetParamCommand,
+    native_device_profile,
 )
 from synchroni_sensor_sdk.core.exceptions import SensorNotInitializedError, SensorNotReadyError
 from synchroni_sensor_sdk.core.params import FilterParam, NtfParam, ParamToggle
@@ -284,7 +285,21 @@ class GForceDriver(Driver):
             raise SensorNotReadyError("Cannot read device info: device is not connected.")
         if self._data_context._device_info is None:
             raise SensorNotInitializedError("Device info is available after sensor.init() completes successfully.")
-        return parse_device_info_to_public(self._data_context._device_info)
+        parsed_info = self._data_context._device_info
+        native_profile = native_device_profile(parsed_info.DeviceName, parsed_info.ModelName)
+        supported_filters: frozenset[str]
+        filter_support = self._data_context.firmware_filters_supported
+        if filter_support is False:
+            supported_filters = frozenset()
+        elif native_profile is not None:
+            supported_filters = native_profile.supported_filters
+        else:
+            supported_filters = frozenset(("50hz", "60hz", "hpf", "lpf")) if filter_support else frozenset()
+        return parse_device_info_to_public(
+            parsed_info,
+            supported_streams=self._data_context.supported_streams(),
+            supported_filters=supported_filters,
+        )
 
     async def get_battery_level(self) -> int:
         if not self.is_connected() or self._protocol is None:
@@ -354,6 +369,9 @@ class GForceDriver(Driver):
         if self._data_context is None:
             raise SensorNotReadyError("Cannot set parameters: device was not connected.")
 
+        if self._streaming and (command.eeg_sample_rate_hz is not None or command.emg_sample_rate_hz is not None):
+            raise SensorNotReadyError("Sample rates cannot be changed while streaming.")
+
         ctx = self._data_context
         ntf_changed = False
 
@@ -384,22 +402,21 @@ class GForceDriver(Driver):
         if command.enable_ntf_imu is not None:
             ctx.apply_imu_master(command.enable_ntf_imu)
             ntf_changed = True
-        else:
-            sub_changed = False
-            if command.enable_ntf_acc is not None:
-                _set_ntf(NtfParam.NTF_GFORCE_ACC, command.enable_ntf_acc)
-                sub_changed = True
-            if command.enable_ntf_gyro is not None:
-                _set_ntf(NtfParam.NTF_GFORCE_GYRO, command.enable_ntf_gyro)
-                sub_changed = True
-            if command.enable_ntf_euler is not None:
-                _set_ntf(NtfParam.NTF_GFORCE_EULER, command.enable_ntf_euler)
-                sub_changed = True
-            if command.enable_ntf_quat is not None:
-                _set_ntf(NtfParam.NTF_GFORCE_QUAT, command.enable_ntf_quat)
-                sub_changed = True
-            if sub_changed:
-                ctx.sync_imu_master_from_subs()
+        sub_changed = False
+        if command.enable_ntf_acc is not None:
+            _set_ntf(NtfParam.NTF_GFORCE_ACC, command.enable_ntf_acc)
+            sub_changed = True
+        if command.enable_ntf_gyro is not None:
+            _set_ntf(NtfParam.NTF_GFORCE_GYRO, command.enable_ntf_gyro)
+            sub_changed = True
+        if command.enable_ntf_euler is not None:
+            _set_ntf(NtfParam.NTF_GFORCE_EULER, command.enable_ntf_euler)
+            sub_changed = True
+        if command.enable_ntf_quat is not None:
+            _set_ntf(NtfParam.NTF_GFORCE_QUAT, command.enable_ntf_quat)
+            sub_changed = True
+        if sub_changed and command.enable_ntf_imu is None:
+            ctx.sync_imu_master_from_subs()
 
         # Legacy mutual exclusion for old EMG when both EMG and GEST are on.
         if ntf_changed and not ctx.isNewEMG and ctx._ntf_on(NtfParam.NTF_EMG) and ctx._ntf_on(NtfParam.NTF_GEST):
@@ -408,14 +425,24 @@ class GForceDriver(Driver):
             elif command.enable_ntf_emg is True:
                 ctx.init_map[NtfParam.NTF_GEST] = ParamToggle.OFF
 
-        if command.enable_filter_50hz is not None:
-            await ctx.setFilter(FilterParam.FILTER_50HZ, ParamToggle.from_bool(command.enable_filter_50hz))
-        if command.enable_filter_60hz is not None:
-            await ctx.setFilter(FilterParam.FILTER_60HZ, ParamToggle.from_bool(command.enable_filter_60hz))
-        if command.enable_filter_hpf is not None:
-            await ctx.setFilter(FilterParam.FILTER_HPF, ParamToggle.from_bool(command.enable_filter_hpf))
-        if command.enable_filter_lpf is not None:
-            await ctx.setFilter(FilterParam.FILTER_LPF, ParamToggle.from_bool(command.enable_filter_lpf))
+        filter_changes = {
+            key: ParamToggle.from_bool(value)
+            for key, value in (
+                (FilterParam.FILTER_50HZ, command.enable_filter_50hz),
+                (FilterParam.FILTER_60HZ, command.enable_filter_60hz),
+                (FilterParam.FILTER_HPF, command.enable_filter_hpf),
+                (FilterParam.FILTER_LPF, command.enable_filter_lpf),
+            )
+            if value is not None
+        }
+        if filter_changes:
+            await ctx.set_filters(filter_changes)
+
+        if command.eeg_sample_rate_hz is not None:
+            await ctx.set_eeg_sample_rate(command.eeg_sample_rate_hz, apply_to_device=self._inited)
+
+        if command.emg_sample_rate_hz is not None:
+            await ctx.set_emg_sample_rate(command.emg_sample_rate_hz, apply_to_device=self._inited)
 
         if command.debug_ble_data_path is not None:
             await ctx.setDebugCSV(command.debug_ble_data_path)

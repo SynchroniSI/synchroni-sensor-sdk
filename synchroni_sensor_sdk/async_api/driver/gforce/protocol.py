@@ -25,6 +25,11 @@ COMMAND_MIN_INTERVAL_S = 0.075
 SAME_OPCODE_COOLDOWN_S = 3.0
 # Extra cool-down for firmware filter set/get (recorder RESPONSE_REUSE_GUARD ~3.05s).
 FILTER_CMD_COOLDOWN_S = 3.05
+MANAGED_USB_ACK_COMMAND_ATTEMPTS = 2
+# Wristband firmware can fragment command notifications when it retains the
+# default ATT MTU. Fragments use reverse-order sequence numbers (N ... 0).
+MAX_PARTIAL_COMMAND_PACKET_ID = 32
+MAX_PARTIAL_COMMAND_RESPONSE_BYTES = 4096
 
 
 @runtime_checkable
@@ -44,7 +49,12 @@ class BleGattClient(Protocol):
 
     async def stop_notify(self, char_specifier: str) -> None: ...
 
-    async def write_gatt_char(self, char_specifier: str, data: bytes | bytearray, response: bool = False) -> None: ...
+    async def write_gatt_char(
+        self,
+        char_specifier: str,
+        data: bytes | bytearray,
+        response: bool | None = None,
+    ) -> None: ...
 
 
 def _response_bytes(payload: bytes | None) -> bytes:
@@ -271,6 +281,16 @@ class SamplingRate(IntEnum):
     HZ_250 = (250,)
     HZ_500 = (500,)
     HZ_650 = (650,)
+    HZ_1000 = (1000,)
+
+
+# PyPI sensor-sdk 0.9.6 decodes the EEG/ECG capability mask in this order.
+EEG_CAP_FS_BITMASK_RATES = (250, 500, 1000, 2000)
+
+
+def decode_cap_fs_bitmask(mask: int) -> tuple[int, ...]:
+    """Decode the EEG/ECG rate mask used by the released Python SDK."""
+    return tuple(rate for bit, rate in enumerate(EEG_CAP_FS_BITMASK_RATES) if mask & (1 << bit))
 
 
 @dataclass
@@ -495,6 +515,18 @@ class Response:
     data: bytes
 
 
+class CommandResponseError(RuntimeError):
+    """A device acknowledgement explicitly rejected a protocol command."""
+
+    def __init__(self, cmd: Command, code: ResponseCode) -> None:
+        self.cmd = cmd
+        self.code = code
+        super().__init__(f"Device rejected {cmd.name} with {code.name}")
+
+
+CommandReply = bytes | CommandResponseError | None
+
+
 class GForceProtocol:
     def __init__(
         self,
@@ -519,7 +551,7 @@ class GForceProtocol:
         self.cmd_char: str = cmd_char
         self.data_char: str = data_char
         # Opcode → payload queue. ``None`` is a cancel/sentinel (clear pending).
-        self.responses: dict[Command, asyncio.Queue[bytes | None] | None] = {}
+        self.responses: dict[Command, asyncio.Queue[CommandReply] | None] = {}
         self.resolution: SampleResolution = SampleResolution.BITS_8
         self._num_channels: int = 8
         self._device: BLEDevice = device
@@ -527,6 +559,8 @@ class GForceProtocol:
         self._raw_data_buf: asyncio.Queue[bytes] | None = None
         self.packet_id: int = 0
         self.data_packet: list = []
+        self._partial_cmd_expected_id: int | None = None
+        self._partial_cmd_response = bytearray()
         self._managed_usb_transport = managed_usb_transport
         self._managed_usb_peer_address = managed_usb_peer_address
         # Serialise command exchanges and enforce cool-downs (replaces queue timestamps).
@@ -745,20 +779,70 @@ class GForceProtocol:
 
     async def async_on_cmd_response(self, bs: bytes | bytearray) -> None:
         try:
-            # print(bytes(bs))
-            response = self._parse_response(bytes(bs))
+            assembled = self._assemble_cmd_response(bytes(bs))
+            if assembled is None:
+                return
+            response = self._parse_response(assembled)
             queue = self.responses.get(response.cmd)
             if queue is not None:
-                queue.put_nowait(
-                    response.data,
-                )
+                if response.code != ResponseCode.SUCCESS:
+                    queue.put_nowait(CommandResponseError(response.cmd, response.code))
+                else:
+                    queue.put_nowait(response.data)
             else:
-                self._logger.warning("Invalid response: %s", bytes(bs))
+                self._logger.warning("Unexpected response for %s: %s", response.cmd.name, assembled)
         except Exception as e:
             raise Exception(f"Failed to parse response: {e}") from e
 
+    def _reset_partial_cmd_response(self) -> None:
+        self._partial_cmd_expected_id = None
+        self._partial_cmd_response.clear()
+
+    def _assemble_cmd_response(self, bs: bytes) -> bytes | None:
+        """Reassemble one command response fragmented by wristband firmware."""
+        if not bs:
+            self._reset_partial_cmd_response()
+            raise ValueError("Empty command response")
+
+        if bs[0] != ResponseCode.PARTIAL_PACKET:
+            # A complete response supersedes an abandoned partial sequence.
+            self._reset_partial_cmd_response()
+            return bs
+
+        if len(bs) < 3:
+            self._reset_partial_cmd_response()
+            raise ValueError("Partial command response is missing packet content")
+
+        packet_id = bs[1]
+        if packet_id > MAX_PARTIAL_COMMAND_PACKET_ID:
+            self._reset_partial_cmd_response()
+            raise ValueError(f"Partial command packet id {packet_id} exceeds the supported limit")
+
+        if self._partial_cmd_expected_id is None:
+            self._partial_cmd_expected_id = packet_id
+        if packet_id != self._partial_cmd_expected_id:
+            expected = self._partial_cmd_expected_id
+            self._reset_partial_cmd_response()
+            raise ValueError(f"Unexpected partial command packet id: expected {expected}, got {packet_id}")
+
+        fragment = bs[2:]
+        if len(self._partial_cmd_response) + len(fragment) > MAX_PARTIAL_COMMAND_RESPONSE_BYTES:
+            self._reset_partial_cmd_response()
+            raise ValueError("Partial command response exceeds the supported size")
+        self._partial_cmd_response.extend(fragment)
+
+        if packet_id != 0:
+            self._partial_cmd_expected_id = packet_id - 1
+            return None
+
+        assembled = bytes(self._partial_cmd_response)
+        self._reset_partial_cmd_response()
+        return assembled
+
     @staticmethod
     def _parse_response(res: bytes) -> Response:
+        if len(res) < 2:
+            raise ValueError(f"Command response is too short: {len(res)} bytes")
         code = int.from_bytes(res[:1], byteorder="big")
         code = ResponseCode(code)
 
@@ -983,19 +1067,43 @@ class GForceProtocol:
         )
         return bool(len(ret) > 0 and ret[0] == 0)
 
-    async def set_firmware_filter_switch(self, switchStatus: int) -> None:
-        await self._send_request(
-            Request(
-                cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
-                body=bytes([0xFF & switchStatus]),
-                has_res=True,
+    async def set_firmware_filter_switch(self, switchStatus: int) -> bool:
+        try:
+            await self._send_request(
+                Request(
+                    cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
+                    body=bytes([0xFF & switchStatus]),
+                    has_res=True,
+                )
             )
-        )
+        except CommandResponseError as error:
+            if error.code != ResponseCode.NOT_SUPPORT:
+                raise
+            self._logger.warning(
+                "Firmware filter switch is not supported by this device; requested switch=%s",
+                switchStatus,
+            )
+            return False
+        return True
 
-    async def get_firmware_filter_switch(self) -> int:
-        buf = _response_bytes(
-            await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
-        )
+    async def get_firmware_filter_switch(self) -> int | None:
+        """Return the firmware filter mask when the device supports readback.
+
+        Some Force firmware acknowledges ``CMD_GET_FRIMWARE_FILTER_SWITCH``
+        with ``NOT_SUPPORT`` and an empty payload even though the corresponding
+        set command is accepted.  Treat that response as unavailable instead
+        of indexing an empty buffer.
+        """
+        try:
+            buf = _response_bytes(
+                await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
+            )
+        except CommandResponseError as error:
+            if error.code == ResponseCode.NOT_SUPPORT:
+                return None
+            raise
+        if not buf:
+            return None
         return buf[0]
 
     async def set_emg_raw_data_config(self, cfg: EmgRawDataConfig = EmgRawDataConfig()) -> None:
@@ -1044,6 +1152,15 @@ class GForceProtocol:
         )
         return EegRawDataConfig.from_bytes(buf)
 
+    async def set_eeg_raw_data_config(self, cfg: EegRawDataConfig) -> None:
+        await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_EEG_CONFIG,
+                body=cfg.to_bytes(),
+                has_res=True,
+            )
+        )
+
     async def get_eeg_raw_data_cap(self) -> EegRawDataCap:
         buf = _response_bytes(
             await self._send_request(
@@ -1065,6 +1182,15 @@ class GForceProtocol:
             )
         )
         return EcgRawDataConfig.from_bytes(buf)
+
+    async def set_ecg_raw_data_config(self, cfg: EcgRawDataConfig) -> None:
+        await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_ECG_CONFIG,
+                body=cfg.to_bytes(),
+                has_res=True,
+            )
+        )
 
     async def get_imu_raw_data_config(self) -> ImuRawDataConfig:
         buf = _response_bytes(
@@ -1183,16 +1309,21 @@ class GForceProtocol:
             except Exception as e:
                 self._logger.warning("Disconnect error: %s", e)
 
-    def _get_response_channel(self, cmd: Command) -> asyncio.Queue[bytes | None]:
+    def _get_response_channel(
+        self,
+        cmd: Command,
+    ) -> asyncio.Queue[CommandReply]:
         existing = self.responses.get(cmd)
         if existing is not None:
             return existing
-        q: asyncio.Queue[bytes | None] = asyncio.Queue()
+        q: asyncio.Queue[CommandReply] = asyncio.Queue()
         self.responses[cmd] = q
         return q
 
     @staticmethod
-    def _unblock_response_queue(q: asyncio.Queue[bytes | None]) -> None:
+    def _unblock_response_queue(
+        q: asyncio.Queue[CommandReply],
+    ) -> None:
         """Wake waiters blocked on ``q.get()`` with a cancel sentinel (``None``)."""
         while not q.empty():
             try:
@@ -1213,6 +1344,7 @@ class GForceProtocol:
         Call before :meth:`init` / reconnect and on disconnect so a timed-out or
         abandoned wait cannot poison the next command exchange.
         """
+        self._reset_partial_cmd_response()
         channels = [q for q in self.responses.values() if q is not None]
         self.responses.clear()
         for q in channels:
@@ -1245,7 +1377,21 @@ class GForceProtocol:
         self._last_filter_cmd_end_mono = 0.0
 
     async def _send_request(self, req: Request) -> bytes | None:
-        return await self._send_request_internal(req=req)
+        attempts = MANAGED_USB_ACK_COMMAND_ATTEMPTS if self._managed_usb_transport is not None and req.has_res else 1
+        for attempt in range(attempts):
+            result = await self._send_request_internal(req=req)
+            if result is not None or not req.has_res:
+                return result
+            if attempt < attempts - 1:
+                self._logger.warning(
+                    "Managed USB command %s returned no response; retrying %s/%s",
+                    req.cmd.name,
+                    attempt + 2,
+                    attempts,
+                )
+        if self._managed_usb_transport is None or not req.has_res:
+            return None
+        raise RuntimeError(f"Managed USB command {req.cmd.name} returned no response after {attempts} attempts")
 
     async def _send_request_internal(self, req: Request) -> bytes | None:
         """Send one protocol command under the serial lock with cool-downs.
@@ -1257,7 +1403,7 @@ class GForceProtocol:
         async with self._cmd_lock:
             await self._await_command_cooldown(req.cmd)
 
-            q: asyncio.Queue[bytes | None] | None = None
+            q: asyncio.Queue[CommandReply] | None = None
             if req.has_res:
                 # Fresh channel for this exchange (any prior waiters were clear-ed).
                 self._clear_response_channel(req.cmd)
@@ -1273,8 +1419,16 @@ class GForceProtocol:
             if req.body is not None:
                 bs += req.body
 
+            # RFSTAR acknowledges protocol commands through its notification
+            # channel, not through an ATT write response.  If response is left
+            # unspecified, Bleak selects write-with-response on macOS and
+            # CoreBluetooth forcibly disconnects after its 30-second ATT timeout.
+            response = False if self._is_universal_stream else None
             try:
-                await asyncio.wait_for(self._require_client().write_gatt_char(self.cmd_char, bs), timeout=1)
+                await asyncio.wait_for(
+                    self._require_client().write_gatt_char(self.cmd_char, bs, response=response),
+                    timeout=1,
+                )
             except Exception:
                 if req.has_res:
                     self._clear_response_channel(req.cmd)
@@ -1289,11 +1443,11 @@ class GForceProtocol:
             assert q is not None
             try:
                 ret = await asyncio.wait_for(q.get(), 2)
-                self._record_command_complete(req.cmd)
-                if ret is None:
-                    return None
-                return ret
-            except Exception:
+            except TimeoutError:
                 self._clear_response_channel(req.cmd)
                 self._record_command_complete(req.cmd)
                 return None
+            self._record_command_complete(req.cmd)
+            if isinstance(ret, CommandResponseError):
+                raise ret
+            return ret

@@ -15,8 +15,10 @@ from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
     FILTER_CMD_COOLDOWN_S,
     SAME_OPCODE_COOLDOWN_S,
     Command,
+    CommandResponseError,
     GForceProtocol,
     Request,
+    ResponseCode,
 )
 
 
@@ -43,6 +45,19 @@ async def test_clear_pending_responses_unblocks_waiter() -> None:
     assert protocol.responses == {}
     result = await asyncio.wait_for(waiter, timeout=1.0)
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fragmented_command_response_and_rejection_are_preserved() -> None:
+    protocol = _protocol()
+    response = protocol._get_response_channel(Command.GET_FW_REVISION)
+    await protocol.async_on_cmd_response(b"\xff\x01\x00\x06V1.0-")
+    await protocol.async_on_cmd_response(b"\xff\x00test")
+    assert await response.get() == b"V1.0-test"
+
+    rejection = protocol._get_response_channel(Command.SET_EMG_RAWDATA_CONFIG)
+    await protocol.async_on_cmd_response(bytes((ResponseCode.BAD_PARAM, Command.SET_EMG_RAWDATA_CONFIG)))
+    assert isinstance(await rejection.get(), CommandResponseError)
 
 
 @pytest.mark.asyncio
@@ -93,7 +108,8 @@ async def test_command_min_interval_waits_between_sends() -> None:
     protocol = _protocol()
     writes: list[float] = []
 
-    async def write_gatt(_char: str, _data: bytes, _response: bool = False) -> None:
+    async def write_gatt(_char: str, _data: bytes, response: bool | None = None) -> None:
+        del response
         writes.append(time.monotonic())
 
     protocol.client = SimpleNamespace(write_gatt_char=write_gatt)
@@ -144,8 +160,9 @@ async def test_serial_lock_makes_commands_non_overlapping() -> None:
     active = 0
     peaks = 0
 
-    async def write_gatt(_char: str, _data: bytes, _response: bool = False) -> None:
+    async def write_gatt(_char: str, _data: bytes, response: bool | None = None) -> None:
         nonlocal active, peaks
+        del response
         active += 1
         peaks = max(peaks, active)
         await asyncio.sleep(0.03)

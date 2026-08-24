@@ -14,14 +14,17 @@ from synchroni_sensor_sdk.async_api.driver.gforce.convert import sensor_data_to_
 from synchroni_sensor_sdk.async_api.driver.gforce.crc_utils import calc_crc8, crc16_cal
 from synchroni_sensor_sdk.async_api.driver.gforce.parsing_models import DataType, DeviceInfo, Sample, SensorData
 from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
+    CommandResponseError,
     DataSubscription,
     GForceProtocol,
     ImuRawDataConfig,
+    ResponseCode,
     SampleResolution,
     SamplingRate,
+    decode_cap_fs_bitmask,
 )
 from synchroni_sensor_sdk.core.data import SensorData as PublicSensorData
-from synchroni_sensor_sdk.core.device import DeviceParams
+from synchroni_sensor_sdk.core.device import DeviceParams, native_device_profile
 from synchroni_sensor_sdk.core.exceptions import (
     DataContextInitError,
     DataContextInitInProgressError,
@@ -87,6 +90,34 @@ class PPGDataMode(IntEnum):
 
 _MAX_ALLOWED_PACKAGE_INDEX_DELTA = 50
 _WATCHDOG_STALL_S = 5.0
+_EMG_CONFIG_WRITE_ATTEMPTS = 2
+_NEW_EMG_FUNCTION_SWITCH_SETTLE_S = 0.5
+_GFORCE_ULTRA_500_HZ_COMPAT_READBACK_HZ = 1000
+_GFORCE_ULTRA_REQUIRED_MANAGED_ATT_MTU = 247
+_EMG_BYTES_PER_CHANNEL_VALUE = {
+    0: 2,  # New-EMG train/compressed value.
+    7: 1,  # Legacy signed 8-bit value with the device's 119 offset.
+    8: 1,
+    12: 2,
+    16: 2,
+    24: 3,
+}
+
+
+def _emg_sample_count_from_payload(payload_byte_count: int, sensor_data: SensorData) -> int | None:
+    """Return complete EMG frames represented by one packet payload."""
+
+    channel_count = int(sensor_data.channelCount)
+    if channel_count <= 0:
+        return None
+    channel_mask = int(sensor_data.channelMask) & ((1 << channel_count) - 1)
+    active_channel_count = channel_mask.bit_count()
+    bytes_per_channel_value = _EMG_BYTES_PER_CHANNEL_VALUE.get(int(sensor_data.resolutionBits))
+    if payload_byte_count <= 0 or active_channel_count <= 0 or bytes_per_channel_value is None:
+        return None
+    bytes_per_frame = active_channel_count * bytes_per_channel_value
+    sample_count, remainder = divmod(payload_byte_count, bytes_per_frame)
+    return sample_count if sample_count > 0 and remainder == 0 else None
 
 
 class ReadSamplesResult(IntEnum):
@@ -141,6 +172,10 @@ class DataContext:
 
         self.isNewEMG: bool = False
         self.isContainQAT6: bool = False
+        # ``None`` preserves the device's native rate.
+        self._eeg_sample_rate: int | None = None
+        self._eeg_capability_sample_rates: tuple[int, ...] = ()
+        self._emg_sample_rate: SamplingRate | None = None
         self.ppgModel: PPGDataMode = PPGDataMode.PPG_AND_SPO2
         self._last_progress_time: float = 0.0
         self._watchdog_restart_pending: bool = False
@@ -158,6 +193,7 @@ class DataContext:
             for sub in IMU_SUB_PARAMS:
                 self.init_map[sub] = ParamToggle.OFF
         self.filter_map: dict[FilterParam, ParamToggle] = dict(DEFAULT_FILTER_PARAMS)
+        self.firmware_filters_supported: bool | None = None
         self.debugCSVWriter: Any = None
         self._debug_csv_file: TextIO | None = None
         self.debugCSVPath: str | None = None
@@ -251,6 +287,26 @@ class DataContext:
     def hasGyro(self) -> bool:
         return (self.featureMap & FeatureMaps.GFD_FEAT_GYRO.value) != 0
 
+    def supported_streams(self) -> frozenset[str]:
+        """Return public stream names supported by the connected firmware."""
+        checks = (
+            ("emg", self.hasEMG),
+            ("eeg", self.hasEEG),
+            ("ecg", self.hasECG),
+            ("impedance", self.hasImpedance),
+            ("imu", self.hasIMU),
+            ("brth", self.hasBrth),
+            ("mag_angle", self.hasMagAngle),
+            ("gesture", self.hasGEST),
+            ("ppg", self.hasPPG),
+            ("spo2", self.hasPPG),
+            ("euler", self.hasEuler),
+            ("quat", self.hasQuat),
+            ("acc", self.hasAcc),
+            ("gyro", self.hasGyro),
+        )
+        return frozenset(name for name, check in checks if check())
+
     def _ntf_on(self, key: NtfParam) -> bool:
         return self.init_map.get(key, ParamToggle.OFF) == ParamToggle.ON
 
@@ -310,7 +366,8 @@ class DataContext:
             return
         emg_bit = 1 if self._ntf_on(NtfParam.NTF_EMG) else 0
         gest_bit = 1 if (emg_bit and self._ntf_on(NtfParam.NTF_GEST)) else 0
-        await self.gForce.set_function_switch(emg_bit | (gest_bit << 1))
+        # Firmware assigns bit 0 to gesture and bit 1 to raw EMG.
+        await self.gForce.set_function_switch((emg_bit << 1) | gest_bit)
 
     async def apply_subscription(self) -> None:
         """Push current NTF map to the device (after init)."""
@@ -321,20 +378,27 @@ class DataContext:
 
     async def initEMG(self, packageCount: int) -> int:
         config = await self.gForce.get_emg_raw_data_config()
-        data = SensorData()
-        data.deviceMac = self.deviceMac
-        data.dataType = DataType.NTF_EMG
-        data.sampleRate = 500
-        data.resolutionBits = 0
-        data.channelCount = 8
-        data.channelMask = config.channel_mask
-        data.minPackageSampleCount = packageCount
-        data.packageSampleCount = 8
-
-        data.clear()
+        profile_id = self._native_profile_id()
+        is_ultra = profile_id == "force_ultra"
+        # A selected raw-stream rate is authoritative for both gForcePro and
+        # gForce Ultra. OYMotion publishes Ultra as 1000 Hz while its Python
+        # init path hardcodes 500 Hz, so the SDK exposes and preserves both.
+        sample_rate = self._emg_sample_rate
+        if sample_rate is None:
+            sample_rate = SamplingRate.HZ_500 if is_ultra else config.fs
+        if is_ultra and getattr(self.gForce, "_managed_usb_transport", None) is not None:
+            client = getattr(self.gForce, "client", None)
+            negotiated_mtu = int(getattr(client, "mtu_size", 0) or 0)
+            if negotiated_mtu < _GFORCE_ULTRA_REQUIRED_MANAGED_ATT_MTU:
+                raise RuntimeError(
+                    "gForce Ultra requires managed-USB ATT MTU 247 for its 240-byte EMG frame, "
+                    f"but this connection negotiated {negotiated_mtu}; power-cycle the armband/dongle and reconnect"
+                )
         isNewEMG = True
         device_info = self._device_info
-        if device_info is not None:
+        if profile_id in {"force", "force_oct"}:
+            isNewEMG = False
+        elif not is_ultra and device_info is not None:
             device_name = device_info.DeviceName
             if (
                 device_name.startswith("gForce")
@@ -347,38 +411,175 @@ class DataContext:
         self.isNewEMG = isNewEMG
 
         if isNewEMG:
-            # new emg
-            data.packageIndexLength = 2
-            data.packageSampleCount = 8
-            data.resolutionBits = 0
-            gain = 6
-            data.K = 4000000.0 / 8388607.0 / gain
+            package_index_length = 2
+            ultra_1000_hz = is_ultra and sample_rate == SamplingRate.HZ_1000
+            # OYWW transports its 24-bit ADC through logarithmically compressed
+            # values: two bytes per channel at 500 Hz and one byte per channel
+            # at 1000 Hz.  The latter fits 30 frames in the same 240-byte BLE
+            # payload that contains only 15 frames at 500 Hz.
+            resolution_bits = 8 if ultra_1000_hz else 0
             config.resolution = SampleResolution.BITS_8
         else:
-            # old emg
-            data.packageIndexLength = 1
-            data.packageSampleCount = 8
-            data.resolutionBits = 7
-            gain = 1200
-            min_voltage = -1.25 * 1000000
-            max_voltage = 1.25 * 100000
-            div = 127.0
-            conversion_factor = (max_voltage - min_voltage) / gain / div
-            data.K = conversion_factor
-            config.resolution = SampleResolution.BITS_8
+            package_index_length = 1
+            # gForcePro+ exposes 500 Hz at 12-bit and 1000 Hz at 8-bit.
+            config.resolution = (
+                SampleResolution.BITS_12 if sample_rate == SamplingRate.HZ_500 else SampleResolution.BITS_8
+            )
+            resolution_bits = int(config.resolution)
 
-        config.fs = SamplingRate.HZ_500
+        config.fs = sample_rate
         config.channel_mask = 255
-        config.batch_len = 128
+        config.batch_len = 240 if is_ultra and sample_rate == SamplingRate.HZ_1000 else 128
 
         if isNewEMG:
             await self.apply_function_switch()
+            # OYMotion's released legacy path waits for the OYWW function-mode
+            # switch to settle before writing its native EMG configuration.
+            await asyncio.sleep(_NEW_EMG_FUNCTION_SWITCH_SETTLE_S)
 
-        await self.gForce.set_emg_raw_data_config(config)
+        actual_config = await self._write_emg_config_with_readback(
+            config,
+            sample_rate,
+            accept_ultra_500_hz_compat_readback=is_ultra,
+        )
+        actual_rate = self._effective_emg_delivery_rate(sample_rate, actual_config.fs)
+        self._emg_sample_rate = SamplingRate(actual_rate)
         await self.gForce.set_package_id(True)
 
+        data = SensorData()
+        data.deviceMac = self.deviceMac
+        data.dataType = DataType.NTF_EMG
+        data.sampleRate = actual_rate
+        data.resolutionBits = resolution_bits
+        data.channelCount = 8
+        data.minPackageSampleCount = packageCount
+        data.packageIndexLength = package_index_length
+        data.K = 4_000_000.0 / 8_388_607.0 / 6 if isNewEMG else 0.0
+        self._apply_emg_packet_layout(
+            data,
+            actual_config,
+            self._emg_sample_rate,
+            profile_id,
+            legacy_emg=not isNewEMG,
+        )
+        # The received packet calculation below replaces this configuration
+        # estimate before any samples or packet loss are accounted.
+        data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
         return data.channelCount
+
+    @staticmethod
+    def _validate_ultra_emg_config(config: Any, sample_rate: SamplingRate) -> None:
+        expected_batch_len = 240 if sample_rate == SamplingRate.HZ_1000 else 128
+        actual_resolution = int(config.resolution)
+        actual_batch_len = int(config.batch_len)
+        if actual_resolution != int(SampleResolution.BITS_8) or actual_batch_len != expected_batch_len:
+            raise RuntimeError(
+                "gForce Ultra EMG transport readback was "
+                f"{actual_resolution}-bit/{actual_batch_len} bytes, expected 8-bit/{expected_batch_len} bytes "
+                f"at {int(sample_rate)} Hz"
+            )
+
+    def _apply_emg_packet_layout(
+        self,
+        data: SensorData,
+        config: Any,
+        sample_rate: SamplingRate,
+        profile_id: str | None,
+        *,
+        legacy_emg: bool,
+    ) -> None:
+        """Validate one profile's transport and update its parser descriptor."""
+        if profile_id == "force_ultra":
+            self._validate_ultra_emg_config(config, sample_rate)
+            data.resolutionBits = 8 if sample_rate == SamplingRate.HZ_1000 else 0
+        elif legacy_emg:
+            expected = 12 if sample_rate == SamplingRate.HZ_500 else 8
+            actual = int(config.resolution)
+            if actual != expected:
+                raise RuntimeError(
+                    f"EMG resolution readback was {actual}-bit, expected {expected}-bit at {int(sample_rate)} Hz"
+                )
+            data.resolutionBits = 12 if actual == 12 else 7
+            divisor = 2047.0 if actual == 12 else 127.0
+            data.K = (1.25 * 100_000 - (-1.25 * 1_000_000)) / 1200.0 / divisor
+
+        data.sampleRate = int(sample_rate)
+        data.channelMask = int(config.channel_mask)
+        sample_count = _emg_sample_count_from_payload(int(config.batch_len), data)
+        if sample_count is None:
+            raise RuntimeError(
+                "Invalid EMG packet layout: "
+                f"batch_len={config.batch_len}, channels={data.channelMask:#x}, resolution={data.resolutionBits}"
+            )
+        data.packageSampleCount = sample_count
+
+    async def _write_emg_config_with_readback(
+        self,
+        config: Any,
+        sample_rate: SamplingRate,
+        *,
+        accept_ultra_500_hz_compat_readback: bool = False,
+    ) -> Any:
+        """Request an EMG rate twice at most and require a matching readback."""
+        expected_rate = int(sample_rate)
+        actual_config = config
+        for attempt in range(_EMG_CONFIG_WRITE_ATTEMPTS):
+            config.fs = sample_rate
+            try:
+                await self.gForce.set_emg_raw_data_config(config)
+            except CommandResponseError as error:
+                if error.code not in {ResponseCode.BAD_PARAM, ResponseCode.NOT_SUPPORT}:
+                    raise
+                actual_config = await self.gForce.get_emg_raw_data_config()
+                actual_rate = int(actual_config.fs)
+                if actual_rate == expected_rate:
+                    return actual_config
+                raise RuntimeError(
+                    f"Device rejected the selected {expected_rate} Hz EMG rate with {error.code.name} "
+                    f"and reports {actual_rate} Hz"
+                ) from error
+            actual_config = await self.gForce.get_emg_raw_data_config()
+            actual_rate = int(actual_config.fs)
+            if actual_rate == expected_rate:
+                return actual_config
+            if (
+                accept_ultra_500_hz_compat_readback
+                and expected_rate == 500
+                and actual_rate == _GFORCE_ULTRA_500_HZ_COMPAT_READBACK_HZ
+            ):
+                self._logger.info(
+                    "gForce Ultra returned the legacy %s Hz config value after accepting the selected %s Hz EMG rate",
+                    actual_rate,
+                    expected_rate,
+                )
+                return actual_config
+            if attempt < _EMG_CONFIG_WRITE_ATTEMPTS - 1:
+                self._logger.warning(
+                    "EMG sample-rate readback was %s Hz, expected %s Hz; retrying configuration",
+                    actual_rate,
+                    expected_rate,
+                )
+        raise RuntimeError(f"EMG sample-rate readback was {int(actual_config.fs)} Hz, expected {expected_rate} Hz")
+
+    def _native_profile_id(self) -> str | None:
+        profile = native_device_profile(
+            getattr(self._device_info, "DeviceName", ""),
+            getattr(self._device_info, "ModelName", ""),
+        )
+        return profile.profile_id if profile is not None else None
+
+    def _is_gforce_ultra(self) -> bool:
+        return self._native_profile_id() == "force_ultra"
+
+    def _effective_emg_delivery_rate(self, requested: SamplingRate, reported: SamplingRate) -> int:
+        if (
+            self._is_gforce_ultra()
+            and int(requested) == 500
+            and int(reported) == _GFORCE_ULTRA_500_HZ_COMPAT_READBACK_HZ
+        ):
+            return 500
+        return int(reported)
 
     async def initGesture(self, _packageCount: int) -> int:
         emg_rate = 0
@@ -412,6 +613,7 @@ class DataContext:
     async def initEEG(self, packageCount: int) -> int:
         config = await self.gForce.get_eeg_raw_data_config()
         cap = await self.gForce.get_eeg_raw_data_cap()
+        config = await self._configure_eeg_sample_rate(config, cap)
         data = SensorData()
         data.deviceMac = self.deviceMac
         data.dataType = DataType.NTF_EEG
@@ -425,6 +627,34 @@ class DataContext:
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_EEG] = data
         return data.channelCount
+
+    async def _configure_eeg_sample_rate(self, config: Any, capability: Any) -> Any:
+        self._eeg_capability_sample_rates = decode_cap_fs_bitmask(int(capability.fs))
+        requested_rate = self._eeg_sample_rate
+        if requested_rate is None:
+            return config
+        if self._eeg_capability_sample_rates and requested_rate not in self._eeg_capability_sample_rates:
+            raise ValueError(
+                f"EEG sample rate {requested_rate} Hz is not advertised by this device; "
+                f"supported rates are {self._eeg_capability_sample_rates}"
+            )
+
+        config.fs = requested_rate
+        await self.gForce.set_eeg_raw_data_config(config)
+        actual_config = await self.gForce.get_eeg_raw_data_config()
+        if int(actual_config.fs) != requested_rate:
+            raise RuntimeError(f"EEG sample-rate readback was {int(actual_config.fs)} Hz, expected {requested_rate} Hz")
+
+        if self.hasECG():
+            ecg_config = await self.gForce.get_ecg_raw_data_config()
+            ecg_config.fs = SamplingRate(requested_rate)
+            await self.gForce.set_ecg_raw_data_config(ecg_config)
+            actual_ecg_config = await self.gForce.get_ecg_raw_data_config()
+            if int(actual_ecg_config.fs) != requested_rate:
+                raise RuntimeError(
+                    f"ECG sample-rate readback was {int(actual_ecg_config.fs)} Hz, expected {requested_rate} Hz"
+                )
+        return actual_config
 
     async def initECG(self, packageCount: int) -> int:
         config = await self.gForce.get_ecg_raw_data_config()
@@ -731,10 +961,16 @@ class DataContext:
         self._last_progress_time = time.monotonic()
         self._watchdog_restart_pending = False
 
-        if not self.isUniversalStream:
-            await self.gForce.start_streaming(self._rawDataBuffer)
-        else:
-            await self.gForce.set_subscription(self.notifyDataFlag)
+        try:
+            if not self.isUniversalStream:
+                await self.gForce.start_streaming(self._rawDataBuffer)
+            else:
+                await self.gForce.set_subscription(self.notifyDataFlag)
+        except (Exception, asyncio.CancelledError):
+            # Notification setup is the commit point for streaming. Leave the
+            # context retryable when setup fails or its caller is cancelled.
+            self._is_data_transfering = False
+            raise
 
         return True
 
@@ -758,17 +994,101 @@ class DataContext:
 
         return True
 
-    async def setFilter(self, filter: FilterParam, value: ParamToggle) -> str:
-        self.filter_map[filter] = value
+    async def set_filters(self, changes: dict[FilterParam, ParamToggle]) -> None:
+        """Apply one combined firmware filter switch and verify its readback."""
+        desired = dict(self.filter_map)
+        desired.update(changes)
         switch = 0
-        for filter_key, toggle in self.filter_map.items():
+        for filter_key, toggle in desired.items():
             if toggle == ParamToggle.ON:
                 switch |= filter_key.firmware_switch_bit
-        try:
-            await self.gForce.set_firmware_filter_switch(switch)
-            return "OK"
-        except Exception as e:
-            return "ERROR: " + str(e)
+        write_supported = await self.gForce.set_firmware_filter_switch(switch)
+        if write_supported is False:
+            self.firmware_filters_supported = False
+            self._logger.warning(
+                "Firmware filters are unavailable; continuing with every firmware filter disabled",
+            )
+            self.filter_map = dict.fromkeys(FilterParam, ParamToggle.OFF)
+            return
+        self.firmware_filters_supported = True
+        actual = await self.gForce.get_firmware_filter_switch()
+        if actual is None:
+            self._logger.warning(
+                "Firmware filter readback is unavailable; continuing with requested switch=%s",
+                switch,
+            )
+            self.filter_map = desired
+            return
+        if actual != switch:
+            raise RuntimeError(f"Firmware filter readback was {actual}, expected {switch}")
+        self.filter_map = desired
+
+    async def set_emg_sample_rate(self, sample_rate_hz: int, *, apply_to_device: bool) -> None:
+        """Select a configurable EMG rate and keep parser/device metadata consistent."""
+        if sample_rate_hz not in (500, 1000):
+            raise ValueError("EMG sample rate must be 500 or 1000 Hz")
+        sample_rate = SamplingRate(sample_rate_hz)
+        profile_id = self._native_profile_id()
+        is_ultra = profile_id == "force_ultra"
+        is_legacy_force = profile_id in {"force", "force_oct"}
+        actual_config: Any | None = None
+        if apply_to_device:
+            config = await self.gForce.get_emg_raw_data_config()
+            if is_legacy_force:
+                config.resolution = (
+                    SampleResolution.BITS_12 if sample_rate == SamplingRate.HZ_500 else SampleResolution.BITS_8
+                )
+            elif is_ultra:
+                config.resolution = SampleResolution.BITS_8
+                config.batch_len = 240 if sample_rate == SamplingRate.HZ_1000 else 128
+            actual_config = await self._write_emg_config_with_readback(
+                config,
+                sample_rate,
+                accept_ultra_500_hz_compat_readback=is_ultra,
+            )
+            sample_rate = SamplingRate(self._effective_emg_delivery_rate(sample_rate, actual_config.fs))
+        self._emg_sample_rate = sample_rate
+        emg_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
+        if emg_data.sampleRate > 0:
+            if actual_config is None:
+                emg_data.sampleRate = int(sample_rate)
+            else:
+                self._apply_emg_packet_layout(
+                    emg_data,
+                    actual_config,
+                    sample_rate,
+                    profile_id,
+                    legacy_emg=is_legacy_force,
+                )
+        if self._device_info is not None and self._device_info.EmgChannelCount > 0:
+            self._device_info.EmgSampleRate = int(sample_rate)
+
+    async def set_eeg_sample_rate(self, sample_rate_hz: int, *, apply_to_device: bool) -> None:
+        """Select the bound EEG/ECG rate published by sensor-sdk 0.9.6."""
+        if sample_rate_hz not in (250, 500):
+            raise ValueError("EEG sample rate must be 250 or 500 Hz")
+        if self._eeg_capability_sample_rates and sample_rate_hz not in self._eeg_capability_sample_rates:
+            raise ValueError(
+                f"EEG sample rate {sample_rate_hz} Hz is not advertised by this device; "
+                f"supported rates are {self._eeg_capability_sample_rates}"
+            )
+        self._eeg_sample_rate = sample_rate_hz
+        if apply_to_device:
+            config = await self.gForce.get_eeg_raw_data_config()
+            capability = await self.gForce.get_eeg_raw_data_cap()
+            await self._configure_eeg_sample_rate(config, capability)
+
+        eeg_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
+        if eeg_data.sampleRate > 0:
+            eeg_data.sampleRate = sample_rate_hz
+        ecg_data = self.sensorDatas[SensorDataType.DATA_TYPE_ECG]
+        if ecg_data.sampleRate > 0:
+            ecg_data.sampleRate = sample_rate_hz
+        if self._device_info is not None:
+            if self._device_info.EegChannelCount > 0:
+                self._device_info.EegSampleRate = sample_rate_hz
+            if self._device_info.EcgChannelCount > 0:
+                self._device_info.EcgSampleRate = sample_rate_hz
 
     async def setDebugCSV(self, debugFilePath: str | None) -> str:
         if self._debug_csv_file is not None:
@@ -930,6 +1250,23 @@ class DataContext:
             dispatch(SensorDataType.DATA_TYPE_MAG_ANGLE, 4, 0)
         elif v == DataType.NTF_EMG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
+            payload_byte_count = len(data) - 1 - sensor_data.packageIndexLength
+            packet_sample_count = _emg_sample_count_from_payload(payload_byte_count, sensor_data)
+            if packet_sample_count is None:
+                message = (
+                    "Ignoring malformed EMG packet: "
+                    f"bytes={len(data)}, channels={sensor_data.channelMask:#x}, "
+                    f"resolution={sensor_data.resolutionBits}"
+                )
+                self._logger.warning(message)
+                if self._on_error is not None:
+                    with contextlib.suppress(Exception):
+                        self._on_error(message)
+                return
+            # Firmware batch_len is a byte count, while packageSampleCount is
+            # a frame count. Derive it from every wire packet so all EMG
+            # layouts (legacy, compressed, concatenated, or masked) are exact.
+            sensor_data.packageSampleCount = packet_sample_count
             dispatch(SensorDataType.DATA_TYPE_EMG, sensor_data.packageIndexLength + 1, 0)
         elif v == DataType.NTF_GEST:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GEST]
@@ -1010,12 +1347,25 @@ class DataContext:
                 offset += sensorData.packageIndexLength
                 newPackageIndex = packageIndex
                 lastPackageIndex = sensorData.lastPackageIndex
-                if sensorData.lastPackageCounter < 0 and newPackageIndex > 0:
-                    sensorData.lastPackageIndex = lastPackageIndex = newPackageIndex - 1
+                if sensorData.lastPackageCounter < 0:
+                    # Prime the counter so packet zero is accepted as the first
+                    # packet instead of being mistaken for a duplicate.
+                    lastPackageIndex = newPackageIndex - 1 if newPackageIndex > 0 else maxPackageIndex
+                    sensorData.lastPackageIndex = lastPackageIndex
                     sensorData.lastPackageCounter = 0
 
                 if packageIndex < lastPackageIndex:
-                    packageIndex += maxPackageIndex + 1
+                    rollover_delta = packageIndex + maxPackageIndex + 1 - lastPackageIndex
+                    if rollover_delta > _MAX_ALLOWED_PACKAGE_INDEX_DELTA:
+                        # BLE notifications can arrive late after a newer packet.
+                        self._logger.warning(
+                            "Dropping stale packet index %s after %s for %s",
+                            packageIndex,
+                            lastPackageIndex,
+                            sensorData.dataType,
+                        )
+                        return False
+                    packageIndex = lastPackageIndex + rollover_delta
                 elif packageIndex == lastPackageIndex:
                     return False
 
@@ -1089,6 +1439,9 @@ class DataContext:
 
         _impedanceData = self.impedanceData.copy()
         _saturationData = self.saturationData.copy()
+        is_ultra_compressed_8 = (
+            sensorData.dataType == DataType.NTF_EMG and sensorData.resolutionBits == 8 and self._is_gforce_ultra()
+        )
 
         channelSamples = sensorData.channelSamples
         if not channelSamples:
@@ -1128,9 +1481,23 @@ class DataContext:
                             rawData -= 119
                             offset += 1
                         elif sensorData.resolutionBits == 8:
-                            rawData = data[offset] & 0xFF
+                            if is_ultra_compressed_8:
+                                rawData = data[offset]
+                                if rawData >= 0x80:
+                                    rawData -= 0x100
+                                rawData = self.transTrainData(rawData)
+                            else:
+                                rawData = data[offset] & 0xFF
                             offset += 1
-                        elif sensorData.resolutionBits == 12 or sensorData.resolutionBits == 16:
+                        elif sensorData.resolutionBits == 12:
+                            rawData = int.from_bytes(
+                                data[offset : offset + 2],
+                                byteorder="little",
+                                signed=False,
+                            )
+                            rawData -= 2000
+                            offset += 2
+                        elif sensorData.resolutionBits == 16:
                             rawData = int.from_bytes(
                                 data[offset : offset + 2],
                                 byteorder="little",
@@ -1176,10 +1543,7 @@ class DataContext:
         if realSampleCount < sensorData.minPackageSampleCount:
             return
 
-        sensorData.channelSamples = []
         batchCount = realSampleCount // sensorData.minPackageSampleCount
-        # leftSampleSize = realSampleCount - sensorData.minPackageSampleCount * batchCount
-
         sensorDataList = []
         startIndex = 0
         for _batchIndex in range(batchCount):
@@ -1197,7 +1561,15 @@ class DataContext:
             sensorDataResult.deviceMac = sensorData.deviceMac
             sensorDataResult.sampleRate = sensorData.sampleRate
             sensorDataResult.channelCount = sensorData.channelCount
+            sensorDataResult.packageSampleCount = sensorData.packageSampleCount
+            sensorDataResult.packageIndexLength = sensorData.packageIndexLength
+            sensorDataResult.lastPackageCounter = sensorData.lastPackageCounter
+            sensorDataResult.lastPackageIndex = sensorData.lastPackageIndex
+            sensorDataResult.lostPackageCount = sensorData.lostPackageCount
+            sensorDataResult.resolutionBits = sensorData.resolutionBits
+            sensorDataResult.channelMask = sensorData.channelMask
             sensorDataResult.minPackageSampleCount = sensorData.minPackageSampleCount
+            sensorDataResult.K = sensorData.K
             sensorDataList.append(sensorDataResult)
 
             if self.debugCSVPath is not None and self.debugCSVPath != "" and self.debugCSVWriter is None:
@@ -1231,6 +1603,9 @@ class DataContext:
 
             startIndex += sensorData.minPackageSampleCount
 
+        # A physical BLE packet does not have to be an exact multiple of the
+        # public callback batch size. Preserve its un-emitted tail for the next
+        # packet instead of silently discarding samples.
         leftChannelSamples = []
         for channelIndex in range(sensorData.channelCount):
             oldSamples = oldChannelSamples[channelIndex]

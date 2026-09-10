@@ -103,7 +103,6 @@ class _ManagedUsbIngressDiagnostics:
 
     transport_name: str
     transfer_count: int
-    started_ns: int = field(default_factory=time.monotonic_ns)
     last_log_ns: int = field(default_factory=time.monotonic_ns)
     usb_completions: int = 0
     usb_bytes: int = 0
@@ -535,7 +534,6 @@ def _enable_managed_usb_acl_read_pipeline(
     def handle_acl_transfer(completed: Any) -> None:
         _managed_usb_acl_transfer_callback(source, completed)
 
-    added = 0
     for _ in range(additional_transfer_count):
         transfer: Any | None = None
         registered = False
@@ -553,7 +551,6 @@ def _enable_managed_usb_acl_read_pipeline(
             pipeline_transfers.append(transfer)
             registered = True
             transfer.submit()
-            added += 1
         except Exception:
             if transfer is not None:
                 if registered:

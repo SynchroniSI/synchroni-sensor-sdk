@@ -213,6 +213,7 @@ class DataContext:
         self._rawDataBuffer: asyncio.Queue[RawDataPacket] = buf
         self._publish_data = publish_data
         self._deferred_publications: list[PublicSensorData] | None = None
+        self._reorder_flush_lock = asyncio.Lock()
         self._on_error = on_error
         self._concatDataBuffer: bytearray = bytearray()
         self._packet_reorder_states: dict[int, _PacketReorderState] = {}
@@ -235,7 +236,6 @@ class DataContext:
         self._emg_sample_rate: SamplingRate | None = None
         self._emg_capability_sample_rates: tuple[int, ...] = ()
         self.ppgModel: PPGDataMode = PPGDataMode.PPG_AND_SPO2
-        self._last_progress_time: float = 0.0
         self._watchdog_restart_pending: bool = False
 
         self.sensorDatas: list[SensorData] = []
@@ -263,6 +263,8 @@ class DataContext:
         sensor_type = _REORDER_SENSOR_TYPE_BY_NOTIFICATION.get(notification_type)
         if sensor_type is None:
             return None
+        if notification_type == DataType.NTF_QUATERNION:
+            sensor_type = self._quaternion_sensor_type()
         sensor_data = self.sensorDatas[sensor_type]
         index_length = int(sensor_data.packageIndexLength)
         if index_length not in (1, 2) or len(data) < 1 + index_length:
@@ -412,17 +414,10 @@ class DataContext:
             )
         return released
 
-    def _ordered_packets(
-        self,
-        packet: RawDataPacket,
-        now_ns: int,
-        *,
-        expire_pending: bool = True,
-    ) -> list[RawDataPacket]:
+    def _ordered_packets(self, packet: RawDataPacket, now_ns: int) -> list[RawDataPacket]:
         # Parser backlog can exceed the reorder deadline even when the missing
-        # packet is already waiting in the raw ingress queue. Production drains
-        # that queue with ``expire_pending=False`` before declaring a gap.
-        released = self._flush_reorder_states(now_ns) if expire_pending else []
+        # packet is already queued. Only the idle/stop flush may expire gaps.
+        released: list[RawDataPacket] = []
         sequence = self._packet_sequence(packet)
         if sequence is None:
             released.append(packet)
@@ -493,19 +488,6 @@ class DataContext:
         else:
             self._parsed_packet_count += 1
 
-    def _process_ingress_packet(self, packet: RawDataPacket, *, expire_pending: bool = True) -> None:
-        for ordered in self._ordered_packets(
-            packet,
-            time.monotonic_ns(),
-            expire_pending=expire_pending,
-        ):
-            self._process_ordered_packet(ordered)
-
-    def _process_flushed_reorder_packets(self, *, force: bool = False) -> None:
-        now_ns = time.monotonic_ns()
-        for ordered in self._flush_reorder_states(now_ns, force=force):
-            self._process_ordered_packet(ordered)
-
     async def _process_packets_fairly(self, packets: list[RawDataPacket]) -> None:
         """Yield for every public output, including multi-output reorder bursts."""
         for packet in packets:
@@ -520,18 +502,13 @@ class DataContext:
                 await asyncio.sleep(0)
 
     async def _flush_reorder_fairly(self, *, force: bool = False) -> None:
-        await self._process_packets_fairly(self._flush_reorder_states(time.monotonic_ns(), force=force))
+        # A flush owns packets outside the raw queue while it yields for publication.
+        # Stop must wait for that owner before declaring its accepted tail drained.
+        async with self._reorder_flush_lock:
+            await self._process_packets_fairly(self._flush_reorder_states(time.monotonic_ns(), force=force))
 
     async def _process_ingress_fairly(self, packet: RawDataPacket) -> None:
-        self._deferred_publications = []
-        try:
-            self._process_ingress_packet(packet, expire_pending=False)
-            publications = self._deferred_publications
-        finally:
-            self._deferred_publications = None
-        for publication in publications:
-            self._publish_data(publication)
-            await asyncio.sleep(0)
+        await self._process_packets_fairly(self._ordered_packets(packet, time.monotonic_ns()))
 
     def _record_parse_error(self, error: Exception, packet: RawDataPacket | None) -> None:
         self._parse_error_count += 1
@@ -684,7 +661,6 @@ class DataContext:
 
     def supported_streams(self) -> frozenset[str]:
         """Return public stream names supported by the connected firmware."""
-        supported: set[str] = set()
         checks = (
             ("emg", self.hasEMG),
             ("eeg", self.hasEEG),
@@ -701,10 +677,7 @@ class DataContext:
             ("acc", self.hasAcc),
             ("gyro", self.hasGyro),
         )
-        for name, check in checks:
-            if check():
-                supported.add(name)
-        return frozenset(supported)
+        return frozenset(name for name, check in checks if check())
 
     def _ntf_on(self, key: NtfParam) -> bool:
         return self.init_map.get(key, ParamToggle.OFF) == ParamToggle.ON
@@ -820,9 +793,6 @@ class DataContext:
         self.isNewEMG = isNewEMG
 
         if isNewEMG:
-            # new emg
-            gain = 6
-            conversion_factor = 4000000.0 / 8388607.0 / gain
             package_index_length = 2
             ultra_1000_hz = is_ultra and sample_rate == SamplingRate.HZ_1000
             # OYWW transports its 24-bit ADC through logarithmically compressed
@@ -832,18 +802,12 @@ class DataContext:
             resolution_bits = 8 if ultra_1000_hz else 0
             config.resolution = SampleResolution.BITS_8
         else:
-            # old emg
-            gain = 1200
-            min_voltage = -1.25 * 1000000
-            max_voltage = 1.25 * 100000
             package_index_length = 1
             # gForcePro+ exposes 500 Hz at 12-bit and 1000 Hz at 8-bit.
             config.resolution = (
                 SampleResolution.BITS_12 if sample_rate == SamplingRate.HZ_500 else SampleResolution.BITS_8
             )
             resolution_bits = int(config.resolution)
-            div = 2047.0 if resolution_bits == 12 else 127.0
-            conversion_factor = (max_voltage - min_voltage) / gain / div
 
         config.fs = sample_rate
         config.channel_mask = 255
@@ -872,8 +836,6 @@ class DataContext:
                     f"at {actual_rate} Hz"
                 )
             resolution_bits = 12 if actual_resolution == 12 else 7
-            div = 2047.0 if resolution_bits == 12 else 127.0
-            conversion_factor = (max_voltage - min_voltage) / gain / div
         self._emg_sample_rate = SamplingRate(actual_rate)
         await self.gForce.set_package_id(True)
 
@@ -886,7 +848,7 @@ class DataContext:
         data.channelMask = actual_config.channel_mask
         data.minPackageSampleCount = packageCount
         data.packageIndexLength = package_index_length
-        data.K = conversion_factor
+        data.K = 4_000_000.0 / 8_388_607.0 / 6 if isNewEMG else 0.0
         self._apply_emg_packet_layout(
             data,
             actual_config,
@@ -1394,7 +1356,6 @@ class DataContext:
         self._drain_queue(self._rawDataBuffer)
         self._concatDataBuffer.clear()
         self.clear()
-        self._last_progress_time = time.monotonic()
         self._watchdog_restart_pending = False
 
         try:
@@ -1662,7 +1623,6 @@ class DataContext:
         if not data:
             return
         v = data[0] & 0x7F
-        self._last_progress_time = time.monotonic()
         self._current_packet_received_monotonic_ns = (
             received_monotonic_ns
             if received_monotonic_ns is not None and received_monotonic_ns > 0
@@ -1796,22 +1756,20 @@ class DataContext:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EULER]
             dispatch(SensorDataType.DATA_TYPE_EULER, sensor_data.packageIndexLength + 1, 0)
         elif v == DataType.NTF_QUATERNION and (self.hasQuat() or self.isContainQAT6):
-            # Prefer dedicated GForce quat slot when present; else IMU QAT6 slot.
-            gforce_quat = self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT]
-            if gforce_quat.sampleRate > 0:
-                dispatch(SensorDataType.DATA_TYPE_GFORCE_QUAT, gforce_quat.packageIndexLength + 1, 0)
-            else:
-                dispatch(
-                    SensorDataType.DATA_TYPE_QUATERNION,
-                    self.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION].packageIndexLength + 1,
-                    0,
-                )
+            sensor_type = self._quaternion_sensor_type()
+            dispatch(sensor_type, self.sensorDatas[sensor_type].packageIndexLength + 1, 0)
         elif v == DataType.NTF_ACC and self.hasAcc():
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
             dispatch(SensorDataType.DATA_TYPE_ACC, sensor_data.packageIndexLength + 1, 0)
         elif v == DataType.NTF_GYRO and self.hasGyro():
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
             dispatch(SensorDataType.DATA_TYPE_GYRO, sensor_data.packageIndexLength + 1, 0)
+
+    def _quaternion_sensor_type(self) -> SensorDataType:
+        """Use the negotiated packet layout for both sequencing and sample parsing."""
+        if self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT].sampleRate > 0:
+            return SensorDataType.DATA_TYPE_GFORCE_QUAT
+        return SensorDataType.DATA_TYPE_QUATERNION
 
     def checkReadSamples(
         self,

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum, StrEnum
 
 
@@ -82,49 +82,31 @@ ORION_PRODUCT_SPECIFICATION = ProductSpecification(
     notes=("OB6000A, OB6000B, and OB6000C are Recorder device-identity aliases.",),
 )
 
-ORION_A_PRODUCT_SPECIFICATION = ProductSpecification(
-    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+ORION_A_PRODUCT_SPECIFICATION = replace(
+    ORION_PRODUCT_SPECIFICATION,
     product_name="Orion-16",
     model_aliases=("Orion-16", "OB6000A", "Orion A", "Synchroni Orion A"),
     eeg_channel_count=16,
-    adc_resolution_bits=24,
-    imu_axis_count=6,
-    bluetooth_version="5.0",
-    nominal_battery_runtime_hours=10.0,
     eeg_acquisition_modes=(SignalAcquisitionMode(250, 24), SignalAcquisitionMode(500, 24)),
-    nominal_imu_sample_rate_hz=50,
     notes=("OB6000A and Orion A are Recorder device-name aliases for the 16-channel variant.",),
-    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
 )
 
-ORION_B_PRODUCT_SPECIFICATION = ProductSpecification(
-    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+ORION_B_PRODUCT_SPECIFICATION = replace(
+    ORION_PRODUCT_SPECIFICATION,
     product_name="Orion-24",
     model_aliases=("Orion-24", "OB6000B", "Orion B", "Synchroni Orion B"),
     eeg_channel_count=24,
-    adc_resolution_bits=24,
-    imu_axis_count=6,
-    bluetooth_version="5.0",
-    nominal_battery_runtime_hours=10.0,
     eeg_acquisition_modes=(SignalAcquisitionMode(250, 24), SignalAcquisitionMode(500, 24)),
-    nominal_imu_sample_rate_hz=50,
     notes=("OB6000B and Orion B are Recorder device-name aliases for the 24-channel variant.",),
-    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
 )
 
-ORION_C_PRODUCT_SPECIFICATION = ProductSpecification(
-    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+ORION_C_PRODUCT_SPECIFICATION = replace(
+    ORION_PRODUCT_SPECIFICATION,
     product_name="Orion-32",
     model_aliases=("Orion-32", "OB6000C", "Orion C", "Synchroni Orion C"),
     eeg_channel_count=32,
-    adc_resolution_bits=24,
-    imu_axis_count=6,
-    bluetooth_version="5.0",
-    nominal_battery_runtime_hours=10.0,
     eeg_acquisition_modes=(SignalAcquisitionMode(250, 24),),
-    nominal_imu_sample_rate_hz=50,
     notes=("OB6000C and Orion C are Recorder device-name aliases for the 32-channel variant.",),
-    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
 )
 
 _ORION_PRODUCT_SPECIFICATIONS_BY_VARIANT = {
@@ -170,18 +152,12 @@ def _nura_variant(
     notes: tuple[str, ...] = (),
     source_urls: tuple[str, ...] = (),
 ) -> ProductSpecification:
-    return ProductSpecification(
-        manufacturer=NURA_PRODUCT_SPECIFICATION.manufacturer,
+    return replace(
+        NURA_PRODUCT_SPECIFICATION,
         product_name=name,
         model_aliases=aliases,
         eeg_channel_count=eeg_channels,
         ecg_channel_count=ecg_channels,
-        adc_resolution_bits=24,
-        imu_axis_count=6,
-        bluetooth_version="4.2",
-        nominal_battery_runtime_hours=12.0,
-        eeg_acquisition_modes=(SignalAcquisitionMode(250, 24),),
-        nominal_imu_sample_rate_hz=50,
         notes=notes,
         source_urls=NURA_PRODUCT_SPECIFICATION.source_urls + source_urls,
     )

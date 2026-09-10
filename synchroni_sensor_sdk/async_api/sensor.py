@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Callable
+from dataclasses import fields
 from typing import Any
 
 from synchroni_sensor_sdk.async_api.driver.base import Driver
@@ -16,23 +18,12 @@ SCIENTIFIC_FAULT_DRAIN_TIMEOUT_SECONDS = 5.0
 
 def _scientific_fault_boundary(message: str) -> tuple[int, int] | None:
     """Read the immutable boundary carried by this error, even after a restart."""
-    parts = message.split("|", 3)
-    if len(parts) < 3 or parts[0] != "SDK_SCIENTIFIC_DELIVERY_FAULT":
-        return None
-    generation = parts[1].removeprefix("delivery_generation=")
-    sequence = parts[2].removeprefix("accepted_sequence=")
-    if not (
-        parts[1].startswith("delivery_generation=")
-        and parts[2].startswith("accepted_sequence=")
-        and generation.isascii()
-        and generation.isdigit()
-        and sequence.isascii()
-        and sequence.isdigit()
-        and len(generation) <= 20
-        and len(sequence) <= 20
-    ):
-        return None
-    return int(generation), int(sequence)
+    match = re.match(
+        r"SDK_SCIENTIFIC_DELIVERY_FAULT\|delivery_generation=([0-9]{1,20})"
+        r"\|accepted_sequence=([0-9]{1,20})(?:\||\Z)",
+        message,
+    )
+    return (int(match[1]), int(match[2])) if match else None
 
 
 class Sensor:
@@ -347,7 +338,21 @@ class Sensor:
             )
 
     async def set_param(self, command: SetParamCommand) -> None:
+        # Keep invalid in-stream rate changes on the driver's non-mutating rejection path.
+        restart = (
+            self.is_streaming()
+            and command.eeg_sample_rate_hz is None
+            and command.emg_sample_rate_hz is None
+            and any(
+                field.name.startswith("enable_ntf_") and getattr(command, field.name) is not None
+                for field in fields(command)
+            )
+        )
+        if restart:
+            await self.stop_streaming()
         await self._driver.set_param(command)
+        if restart:
+            await self.start_streaming()
 
     async def power_off(self) -> None:
         await self._driver.power_off()

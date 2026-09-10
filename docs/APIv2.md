@@ -337,8 +337,9 @@ The async API additionally provides
 `register_scientific_fault_pending_callback(callback)` for immediate fault status
 while the accepted tail drains. Recovery requires an explicit `start_streaming()`;
 it waits for the previous accepted tail and final fault callback to finish.
-`stop_streaming()` drains queued notifications, reordered packets, partial batches,
+`stop_streaming()` waits for any active reorder publication and drains queued notifications, reordered packets, partial batches,
 and in-flight callbacks. Drain failures raise instead of silently discarding data.
+Stream-setting changes use this same callback drain before restarting acquisition.
 
 ---
 

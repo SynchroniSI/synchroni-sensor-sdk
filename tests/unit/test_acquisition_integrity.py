@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -16,6 +17,7 @@ from synchroni_sensor_sdk.async_api.driver.gforce.protocol import RawDataPacket
 from synchroni_sensor_sdk.async_api.driver.ingress import BoundedThreadIngress
 from synchroni_sensor_sdk.async_api.sensor import Sensor
 from synchroni_sensor_sdk.core.data import NtfDataType, Sample, SensorData
+from synchroni_sensor_sdk.core.device import SetParamCommand
 
 
 def _packet(index: int) -> SensorData:
@@ -37,26 +39,10 @@ def _packet(index: int) -> SensorData:
     )
 
 
-def _sensor(*, capacity: int = 2) -> tuple[GForceDriver, Sensor]:
-    driver = GForceDriver("AA:BB")
-    Driver.__init__(driver, "AA:BB", data_buffer_maxsize=capacity)
-    driver._bind_loop()
-    driver._streaming = True
-
-    async def start() -> None:
-        driver.reset_scientific_delivery()
-        driver._streaming = True
-
-    async def stop() -> None:
-        driver._streaming = False
-
-    driver.start_streaming = AsyncMock(side_effect=start)
-    driver.stop_streaming = AsyncMock(side_effect=stop)
-    return driver, Sensor("AA:BB", driver)
-
-
 async def test_overflow_notifies_pending_then_delivers_every_accepted_packet_before_final_fault() -> None:
-    driver, sensor = _sensor()
+    driver, sensor, _context, _raw = _imu_context()
+    Driver.__init__(driver, "test", data_buffer_maxsize=2)
+    driver._bind_loop()
     entered, release, pending, final = (asyncio.Event() for _ in range(4))
     calls: list[tuple[str, object]] = []
 
@@ -101,7 +87,9 @@ async def test_overflow_notifies_pending_then_delivers_every_accepted_packet_bef
 
 
 async def test_callback_failure_is_explicit_and_does_not_discard_the_remaining_accepted_tail() -> None:
-    driver, sensor = _sensor(capacity=4)
+    driver, sensor, context, _raw = _imu_context()
+    driver._inited = True
+    context.apply_subscription = AsyncMock()
     received: list[int] = []
     messages: list[str] = []
     final = asyncio.Event()
@@ -128,6 +116,37 @@ async def test_callback_failure_is_explicit_and_does_not_discard_the_remaining_a
         assert "boundary_settled=true|settled_sequence=4|callback_failure_count=1" in messages[0]
         driver.publish_data_on_loop(_packet(4))
         assert driver.pending_data_packets == 0
+
+        # Explicitly recover, then change settings while an earlier callback is blocked.
+        await sensor.stop_streaming()
+        await sensor.start_streaming()
+        entered, release, stopped = (asyncio.Event() for _ in range(3))
+
+        async def blocked(packet):
+            entered.set()
+            await release.wait()
+            received.append(packet.last_package_counter)
+
+        async def stop():
+            stopped.set()
+
+        context.gForce.stop_streaming = stop
+        await sensor.register_data_callback(blocked)
+        driver.publish_data_on_loop(_packet(4))
+        await asyncio.wait_for(entered.wait(), 1)
+        driver.publish_data_on_loop(_packet(5))
+        changing = asyncio.create_task(sensor.set_param(SetParamCommand(enable_ntf_eeg=False)))
+        try:
+            await asyncio.wait_for(stopped.wait(), 1)
+            await asyncio.sleep(0)
+            assert not changing.done()
+            release.set()
+            await asyncio.wait_for(changing, 1)
+            assert sensor.is_streaming()
+            assert received == [0, 2, 3, 4, 5]
+        finally:
+            release.set()
+            await asyncio.gather(changing, return_exceptions=True)
     finally:
         await sensor._cancel_callback_tasks()
 
@@ -135,7 +154,12 @@ async def test_callback_failure_is_explicit_and_does_not_discard_the_remaining_a
 def _imu_context(*, callback_batch: int = 1):
     driver = GForceDriver("test")
     driver._bind_loop()
-    protocol = SimpleNamespace(_is_universal_stream=False, stop_streaming=AsyncMock(), drain_raw_ingress=AsyncMock())
+    protocol = SimpleNamespace(
+        _is_universal_stream=False,
+        start_streaming=AsyncMock(),
+        stop_streaming=AsyncMock(),
+        drain_raw_ingress=AsyncMock(),
+    )
     raw = asyncio.Queue(maxsize=4096)
     context = DataContext(
         protocol, "test", raw, publish_data=driver._publish_parsed_data, on_error=driver._publish_error
@@ -164,37 +188,49 @@ def _imu_packet(index: int) -> RawDataPacket:
 
 
 async def test_stop_drains_pending_raw_packets_partial_batches_and_inflight_callback() -> None:
-    _driver, sensor, context, raw = _imu_context(callback_batch=2)
-    entered, release = asyncio.Event(), asyncio.Event()
-    received = []
+    driver, sensor, context, raw = _imu_context(callback_batch=2)
+    entered, release, stop_started = (asyncio.Event() for _ in range(3))
+    received, errors, stopping = [], [], []
 
     async def callback(packet):
         entered.set()
         await release.wait()
         received.append(packet)
 
+    def publish(packet):
+        driver.publish_data_on_loop(packet)
+        if not stopping:
+            # Stop exactly while the parser's idle reorder flush has yielded.
+            stopping.append(asyncio.create_task(sensor.stop_streaming()))
+            stop_started.set()
+
+    context._publish_data = publish
     await sensor.register_data_callback(callback)
+    await sensor.register_error_callback(errors.append)
+    for index in range(5):
+        packet = _imu_packet(index)
+        raw.put_nowait(RawDataPacket(packet.data, time.monotonic_ns() - 1_000_000_000))
     parser = asyncio.create_task(context.process_data())
-    for index in range(3):
-        raw.put_nowait(_imu_packet(index))
-    stopping = asyncio.create_task(sensor.stop_streaming())
     try:
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        assert not stopping.done()
+        await asyncio.wait_for(stop_started.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not stopping[0].done()
         release.set()
-        await asyncio.wait_for(stopping, timeout=2)
+        await asyncio.wait_for(stopping[0], 2)
         for kind in (DataType.NTF_ACC, DataType.NTF_GYRO):
-            indices = [
+            assert [
                 sample.sample_index
                 for packet in received
-                if packet.data_type.value == kind.value
+                if packet.data_type == kind
                 for sample in packet.channel_samples[0]
-            ]
-            assert indices == [0, 1, 2]
+            ] == list(range(5))
+        assert errors == []
+        assert driver.scientific_fault_boundary is None
+        assert context._parse_error_count == 0
     finally:
         release.set()
         parser.cancel()
-        await asyncio.gather(parser, stopping, return_exceptions=True)
+        await asyncio.gather(parser, *stopping, return_exceptions=True)
         await sensor._cancel_callback_tasks()
 
 
@@ -213,7 +249,7 @@ async def test_notification_mailbox_has_finite_staging_and_one_fault() -> None:
     assert len(faults) == 1
 
 
-def test_public_conversion_preserves_fractional_values_and_receipt_time() -> None:
+async def test_public_conversion_preserves_fractional_values_and_receipt_time() -> None:
     sample = ParseSample()
     sample.rawData = 7
     sample.data = 0.875
@@ -231,3 +267,18 @@ def test_public_conversion_preserves_fractional_values_and_receipt_time() -> Non
     assert result.received_monotonic_ns == 1_234_567_890
     assert result.delivery_sequence is None
     assert result.delivery_generation is None
+
+    received = []
+    context = DataContext(
+        SimpleNamespace(_is_universal_stream=False), "test", asyncio.Queue(), publish_data=received.append
+    )
+    context.featureMap = FeatureMaps.GFD_FEAT_QUAT.value
+    context._is_data_transfering = True
+    await context.initGForceQuat(1)
+    for index, value in enumerate((1.0, 0.1)):
+        packet = RawDataPacket(bytes((5, index)) + struct.pack("<4f", value, 0, 0, 1), 1_000 + index)
+        await context._process_ingress_fairly(packet)
+        await context._flush_reorder_fairly(force=True)
+    assert [packet.last_package_index for packet in received] == [0, 1]
+    assert [packet.received_monotonic_ns for packet in received] == [1_000, 1_001]
+    assert context._stale_packet_count == 0

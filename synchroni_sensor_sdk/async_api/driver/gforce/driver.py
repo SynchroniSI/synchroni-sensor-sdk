@@ -14,7 +14,8 @@ from synchroni_sensor_sdk.async_api.driver.gforce.constants import (
 )
 from synchroni_sensor_sdk.async_api.driver.gforce.data_context import DataContext
 from synchroni_sensor_sdk.async_api.driver.gforce.device_info import parse_device_info_to_public
-from synchroni_sensor_sdk.async_api.driver.gforce.protocol import GForceProtocol
+from synchroni_sensor_sdk.async_api.driver.gforce.protocol import GForceProtocol, RawDataPacket
+from synchroni_sensor_sdk.async_api.driver.ingress import RAW_NOTIFICATION_QUEUE_CAP
 from synchroni_sensor_sdk.core.data import SensorData
 from synchroni_sensor_sdk.core.device import (
     BleChipType,
@@ -87,7 +88,7 @@ class GForceDriver(Driver):
         self._managed_usb_peer_address = managed_usb_peer_address
         self._protocol: GForceProtocol | None = None
         self._data_context: DataContext | None = None
-        self._raw_queue: asyncio.Queue[bytes] | None = None
+        self._raw_queue: asyncio.Queue[RawDataPacket] | None = None
         self._process_task: asyncio.Task[None] | None = None
         self._power_task: asyncio.Task[None] | None = None
         self._teardown_lock: asyncio.Lock | None = None
@@ -226,11 +227,15 @@ class GForceDriver(Driver):
             self.set_state(DeviceState.DISCONNECTED)
 
     def _publish_parsed_data(self, data: SensorData) -> None:
-        """Bound as ``DataContext`` publish callback; safe from parser task thread context."""
-        self.schedule_publish_data(data)
+        """DataContext runs on this loop; wake its consumer before the parser yields."""
+        self.publish_data_on_loop(data)
 
     def _publish_error(self, message: str) -> None:
         """Bound as ``DataContext`` error callback."""
+        fault_prefix = "SDK_SCIENTIFIC_DELIVERY_FAULT|"
+        if message.startswith(fault_prefix):
+            self.report_scientific_delivery_fault(message[len(fault_prefix) :])
+            return
         self.schedule_publish_error(message)
 
     async def connect(self) -> None:
@@ -253,8 +258,9 @@ class GForceDriver(Driver):
             loop,
             managed_usb_transport=self._managed_usb_transport,
             managed_usb_peer_address=self._managed_usb_peer_address,
+            on_ingress_fault=self.report_scientific_delivery_fault,
         )
-        self._raw_queue = asyncio.Queue()
+        self._raw_queue = asyncio.Queue(maxsize=RAW_NOTIFICATION_QUEUE_CAP)
         await self._protocol.connect(self._on_disconnect, self._raw_queue)
         if self._protocol.client is None or not self._protocol.client.is_connected:
             self.set_state(DeviceState.DISCONNECTED)
@@ -356,6 +362,9 @@ class GForceDriver(Driver):
     async def start_streaming(self) -> None:
         if self._data_context is None or not self._inited:
             raise SensorNotInitializedError("Cannot start streaming: sensor has not been initialized.")
+        self.reset_scientific_delivery()
+        if self._protocol is not None:
+            self._protocol.reset_raw_ingress()
         await self._data_context.start_streaming()
         self._streaming = True
 
@@ -425,16 +434,15 @@ class GForceDriver(Driver):
             elif command.enable_ntf_emg is True:
                 ctx.init_map[NtfParam.NTF_GEST] = ParamToggle.OFF
 
-        filter_changes = {
-            key: ParamToggle.from_bool(value)
-            for key, value in (
-                (FilterParam.FILTER_50HZ, command.enable_filter_50hz),
-                (FilterParam.FILTER_60HZ, command.enable_filter_60hz),
-                (FilterParam.FILTER_HPF, command.enable_filter_hpf),
-                (FilterParam.FILTER_LPF, command.enable_filter_lpf),
-            )
-            if value is not None
-        }
+        filter_changes: dict[FilterParam, ParamToggle] = {}
+        if command.enable_filter_50hz is not None:
+            filter_changes[FilterParam.FILTER_50HZ] = ParamToggle.from_bool(command.enable_filter_50hz)
+        if command.enable_filter_60hz is not None:
+            filter_changes[FilterParam.FILTER_60HZ] = ParamToggle.from_bool(command.enable_filter_60hz)
+        if command.enable_filter_hpf is not None:
+            filter_changes[FilterParam.FILTER_HPF] = ParamToggle.from_bool(command.enable_filter_hpf)
+        if command.enable_filter_lpf is not None:
+            filter_changes[FilterParam.FILTER_LPF] = ParamToggle.from_bool(command.enable_filter_lpf)
         if filter_changes:
             await ctx.set_filters(filter_changes)
 

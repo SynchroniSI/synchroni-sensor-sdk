@@ -100,7 +100,7 @@ on Windows, but managed USB HCI raises `ManagedUsbUnavailableError`.
 | **`BluetoothAdapter`** | One host controller (system or USB). Fields: `id`, `source`, `usb_transport`, `claim_required`, `is_in_use`, VID/PID/serial. |
 | **`ScanResult.adapter_id` / `routes`** | Which radio saw a sensor and optional multi-route RSSI list. Each `RadioAdapter` owns its own MAC scan cache; the hub projects results across radios. |
 | **`RadioAdapter`** | Internal per-HCI transport object (Bleak system vs managed USB). Owns one-shot/continuous scan and `prepare_connection` handles. Not a public app API. |
-| **Hub-session claim** | After a successful managed `connect(..., adapter_id=…)`, that dongle is bound to the sensor MAC until **`hub.close()`**. `disconnect` does not free the dongle for another MAC. |
+| **Hub-session claim** | After a successful managed `connect(..., adapter_id=…)`, that dongle is bound to the sensor MAC until **`hub.close()`** or explicit `release_adapter(...)`. `disconnect` alone does not free the dongle for another MAC. |
 | **Radio session** | Shared powered HCI stack for a transport string. Scan reuses the same open stack for the following connect (no full USB close between them). Sessions are released on hub close. |
 
 **SDK owns:** multi-adapter controller (inventory/claims), `RadioRegistry` + radios (scan caches / connect handles), managed USB GATT, WinUSB claim helper, optional RTK firmware cache.  
@@ -114,7 +114,18 @@ on Windows, but managed USB HCI raises `ManagedUsbUnavailableError`.
 | **Windows** | Known EEG VID/PID devices bound to a non-WinUSB driver show `claim_required=True`. Run `claim_adapter` once (UAC), replug if inventory does not flip to `managed_usb`. Adapter ids encode PnP ``&`` as ``%26`` so they survive `cmd.exe` / `poetry run` when pasted into a shell. |
 | **Linux** | Managed inventory via libusb when Bumble is installed; udev permissions must allow userspace access to the dongle. |
 
-Known USB Bluetooth inventory / Windows claim allowlist is currently limited to TP-Link UB500 `2357:0604` (`KNOWN_USB_BLUETOOTH_VID_PID` / `KNOWN_EEG_USB_DONGLES`).
+The USB inventory / Windows claim allowlist includes TP-Link UB500 `2357:0604`,
+CSR8510 `0a12:0001`, and Actions `10d7:b012`
+(`KNOWN_USB_BLUETOOTH_VID_PID` / `KNOWN_EEG_USB_DONGLES`). A matching VID/PID
+alone does not guarantee a usable route: inspect `connectable`,
+`unavailable_reason`, and `claim_required` before connecting.
+
+`list_cached_bluetooth_adapters()` reads the last inventory without probing USB.
+`scan(..., refresh_inventory=False)` and
+`scan_managed_usb(..., refresh_inventory=False)` reuse that inventory.
+After disconnecting its sensors, call `release_adapter(adapter_id)` to close
+one adapter's radio and release its session claim without closing the hub.
+It raises `BluetoothAdapterBusyError` while sensors remain connected on that adapter.
 
 #### Workflow A — System BLE only
 
@@ -271,7 +282,7 @@ list / claim (Windows) → scan (opens/powers radio, keeps stack for connect)
 
 | Mechanism | Purpose |
 |-----------|---------|
-| RTK auto-fetch | Before managed power-on, VID/PID-scoped Realtek host firmware may be downloaded into a user cache (e.g. TP-Link UB500). Soft-fails if offline. Disable: `SYNCHRONI_RTK_FIRMWARE_AUTO=0`. |
+| RTK auto-fetch | Disabled by default. Set `SYNCHRONI_RTK_FIRMWARE_AUTO=1` to allow VID/PID-scoped Realtek host firmware downloads before managed power-on (e.g. TP-Link UB500). Downloads soft-fail if offline. Otherwise supply local firmware through `BUMBLE_RTK_FIRMWARE_DIR`. |
 | Firmware pins | Optional hub `firmware_resource_dir` + package pin files for known dongles. |
 | `SYNCHRONI_WINUSB_INSTALLER` | Local path to claim helper exe. |
 | `SYNCHRONI_SDK_ASSETS_MANIFEST_URL` | Override remote installer manifest. |
@@ -308,8 +319,26 @@ list / claim (Windows) → scan (opens/powers radio, keeps stack for connect)
 | `start_streaming` / `stop_streaming` | Data path |
 | `register_*_callback` | Data, power, state, error (one active each) |
 | `power_off` / `system_reset` | Device control |
-| `destroy` | Cancel callbacks + driver teardown |
-| `dropped_data_packets` | Drop-oldest buffer counter |
+| `destroy` | Drain a running stream, cancel callbacks, and tear down the driver |
+| `dropped_data_packets` | Parsed-buffer rejection counter; does not count all losses after a latched fault |
+
+### Acquisition faults and stop draining
+
+Raw notification staging, parser queues, and the public data buffer are bounded.
+Overflow or a parser/data-callback failure latches a
+`SDK_SCIENTIFIC_DELIVERY_FAULT` error and stops accepting new public data.
+Previously accepted packets retain their order. The error callback runs after
+their data callbacks settle, or after a five-second drain timeout. Its message
+includes `delivery_generation`, `accepted_sequence`, `boundary_settled`,
+`settled_sequence`, and `callback_failure_count`; a settled boundary can still
+include failed callbacks. Treat the stream as incomplete whenever this fault occurs.
+
+The async API additionally provides
+`register_scientific_fault_pending_callback(callback)` for immediate fault status
+while the accepted tail drains. Recovery requires an explicit `start_streaming()`;
+it waits for the previous accepted tail and final fault callback to finish.
+`stop_streaming()` drains queued notifications, reordered packets, partial batches,
+and in-flight callbacks. Drain failures raise instead of silently discarding data.
 
 ---
 
@@ -322,6 +351,11 @@ list / claim (Windows) → scan (opens/powers radio, keeps stack for connect)
 ### `SensorData`
 
 Includes `lost_package_count` (package-index gap accumulation) plus channel batch fields.
+`Sample.data` and `Sample.impedance` preserve converted floating-point values.
+`received_monotonic_ns` records host notification receipt time (zero if unavailable),
+not a device sample clock or cross-device alignment. `delivery_sequence` is the
+driver's monotonically increasing accepted-packet number; `delivery_generation`
+identifies an explicit stream start. Both are `None` until publication accepts a packet.
 
 ### `DeviceInfo`
 
@@ -363,7 +397,7 @@ Multi-adapter (when enabled): `MultiAdapterDisabledError`, `ManagedUsbUnavailabl
 
 **Module:** `async_api.driver.base` — abstract GForce-style driver. Factory: `core.driver.driver_factory`.
 
-Concrete `GForceDriver` implements connect/init/stream/parse for OYM and RFSTAR (CONCAT_BLE + universal stream), PPG/SpO2, gesture, euler/quat (feature-dependent), filters, NeuCir, power_off/system_reset, and drop-oldest data buffering.
+Concrete `GForceDriver` implements connect/init/stream/parse for OYM and RFSTAR (CONCAT_BLE + universal stream), PPG/SpO2, gesture, euler/quat (feature-dependent), filters, NeuCir, power_off/system_reset, and bounded data buffering with explicit delivery faults.
 
 ---
 

@@ -99,16 +99,16 @@ class ManagedRadioStub:
 
 def test_known_vid_pid() -> None:
     assert is_known_usb_bluetooth_adapter("2357", "0604")  # TP-Link UB500
-    assert not is_known_usb_bluetooth_adapter("0a12", "0001")
-    assert not is_known_usb_bluetooth_adapter("10d7", "b012")
+    assert is_known_usb_bluetooth_adapter("0a12", "0001")  # CSR
+    assert is_known_usb_bluetooth_adapter("10d7", "b012")  # Actions
     assert not is_known_usb_bluetooth_adapter("33fa", "0010")
     assert not is_known_usb_bluetooth_adapter("ffff", "ffff")
 
 
-def test_claim_allowlist_only_tplink() -> None:
+def test_claim_allowlist_known_dongles() -> None:
     from synchroni_sensor_sdk.core.bluetooth import KNOWN_EEG_USB_DONGLES
 
-    assert frozenset({("2357", "0604")}) == KNOWN_EEG_USB_DONGLES
+    assert frozenset({("2357", "0604"), ("0a12", "0001"), ("10d7", "b012")}) == KNOWN_EEG_USB_DONGLES
 
 
 def test_windows_claim_argument_list_quotes_spaces() -> None:

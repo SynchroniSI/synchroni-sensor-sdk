@@ -8,7 +8,9 @@ Mirror sources (in order): GitLab linux-firmware mirror, Linux kernel firmware
 git, Linux from Scratch mirror, Realtek Android open-source tree. Retries 5xx
 failures.
 
-Disable with env ``SYNCHRONI_RTK_FIRMWARE_AUTO=0``.
+Network acquisition is disabled by default. Opt in with
+``SYNCHRONI_RTK_FIRMWARE_AUTO=1``; applications should normally provide pinned,
+locally verified firmware instead.
 """
 
 from __future__ import annotations
@@ -102,7 +104,10 @@ _SOURCES: tuple[_Source, ...] = (
 
 def rtk_firmware_auto_enabled() -> bool:
     """Return whether network auto-fetch of RTK firmware is allowed."""
-    raw = os.environ.get(RTK_FIRMWARE_AUTO_ENV, "1").strip().lower()
+    # Network firmware acquisition is opt-in. Applications that distribute
+    # regulated or reproducible builds should provide verified local firmware
+    # rather than silently consuming moving upstream files.
+    raw = os.environ.get(RTK_FIRMWARE_AUTO_ENV, "0").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 

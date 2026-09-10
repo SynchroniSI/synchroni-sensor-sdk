@@ -36,11 +36,14 @@ def test_parse_usb_vid_pid() -> None:
 
 
 def test_ensure_skips_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert not rtk_fw.rtk_firmware_auto_enabled()
+    assert rtk_fw.ensure_rtk_firmware_available(transport_name="usb:2357:0604/x") is None
     monkeypatch.setenv(rtk_fw.RTK_FIRMWARE_AUTO_ENV, "0")
     assert rtk_fw.ensure_rtk_firmware_available(transport_name="usb:2357:0604/x") is None
 
 
 def test_ensure_skips_unknown_or_path_only_transport(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(rtk_fw.RTK_FIRMWARE_AUTO_ENV, "1")
     fake_rtk = SimpleNamespace(rtk_firmware_dir=lambda: tmp_path, Driver=SimpleNamespace())
     bumble_mod = types.ModuleType("bumble")
     drivers_mod = types.ModuleType("bumble.drivers")
@@ -55,6 +58,8 @@ def test_ensure_skips_unknown_or_path_only_transport(monkeypatch: pytest.MonkeyP
 
 
 def test_ensure_downloads_only_mapped_fw(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(rtk_fw.RTK_FIRMWARE_AUTO_ENV, "1")
+
     def find_binary_path(name: str) -> Path | None:
         path = tmp_path / name
         return path if path.is_file() else None

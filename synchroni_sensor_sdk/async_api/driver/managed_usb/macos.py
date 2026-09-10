@@ -9,7 +9,6 @@ from synchroni_sensor_sdk.async_api.driver.managed_usb.usb_common import (
     first_string,
     list_libusb_managed_usb_adapters,
     looks_like_managed_usb_bluetooth_adapter,
-    managed_usb_transport_name,
     normalize_hex_id,
     normalize_identity_token,
     run_command_json,
@@ -130,24 +129,22 @@ async def list_macos_system_usb_adapters(now: datetime, command_timeout_s: float
         serial_is_unique = candidate.serial_number is not None and serial_counts.get(serial_key, 0) == 1
 
         identity = macos_system_profiler_identity(candidate, device_index, serial_is_unique)
-        usb_transport = managed_usb_transport_name(
-            candidate.vendor_id,
-            candidate.product_id,
-            candidate.serial_number if serial_is_unique else None,
-            device_index=None if serial_is_unique else device_index,
-        )
-
         adapters.append(
             BluetoothAdapter(
                 id=f"{MANAGED_USB_ADAPTER_ID_PREFIX}macos:{identity}",
                 name=candidate.name,
                 source="managed_usb",
                 platform="macos",
-                transport="libusb",
+                transport="usb_metadata",
                 vendor_id=candidate.vendor_id,
                 product_id=candidate.product_id,
                 serial_number=candidate.serial_number,
-                usb_transport=usb_transport,
+                usb_transport=None,
+                connectable=False,
+                unavailable_reason=(
+                    "macOS sees this USB Bluetooth device, but no compatible libusb HCI "
+                    "interface or physical USB route is available."
+                ),
                 is_external=True,
                 last_seen_at=now,
             )

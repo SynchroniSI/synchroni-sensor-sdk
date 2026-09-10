@@ -23,11 +23,12 @@ class DropOldestBuffer(Generic[T]):
     the loop thread.
     """
 
-    def __init__(self, maxsize: int = DEFAULT_DATA_BUFFER_MAXSIZE) -> None:
+    def __init__(self, maxsize: int = DEFAULT_DATA_BUFFER_MAXSIZE, *, reject_on_full: bool = False) -> None:
         self._logger = logging.getLogger(__name__)
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
         self._maxsize = maxsize
+        self._reject_on_full = reject_on_full
         self._buffer: deque[T] = deque(maxlen=maxsize)
         self._lock = asyncio.Lock()
         self._event = asyncio.Event()
@@ -64,6 +65,8 @@ class DropOldestBuffer(Generic[T]):
             return
         if len(self._buffer) == self._maxsize:
             self.dropped += 1
+            if self._reject_on_full:
+                raise BufferError("Parsed sensor data buffer is full")
         self._buffer.append(item)
         self._event.set()
 
@@ -72,7 +75,14 @@ class DropOldestBuffer(Generic[T]):
             return
         if len(self._buffer) == self._maxsize:
             self.dropped += 1
+            if self._reject_on_full:
+                raise BufferError("Parsed sensor data buffer is full")
         self._buffer.append(item)
+
+    def clear_on_loop(self) -> None:
+        """Discard the previous stream's tail only at an explicit stream-start boundary."""
+        self._buffer.clear()
+        self._event.clear()
 
     async def close(self) -> None:
         async with self._lock:

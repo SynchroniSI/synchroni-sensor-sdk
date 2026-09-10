@@ -11,6 +11,29 @@ from synchroni_sensor_sdk.core.data import SensorData
 from synchroni_sensor_sdk.core.device import BleChipType, DeviceInfo, DeviceParams, DeviceState, SetParamCommand
 from synchroni_sensor_sdk.core.driver import driver_factory
 
+SCIENTIFIC_FAULT_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+def _scientific_fault_boundary(message: str) -> tuple[int, int] | None:
+    """Read the immutable boundary carried by this error, even after a restart."""
+    parts = message.split("|", 3)
+    if len(parts) < 3 or parts[0] != "SDK_SCIENTIFIC_DELIVERY_FAULT":
+        return None
+    generation = parts[1].removeprefix("delivery_generation=")
+    sequence = parts[2].removeprefix("accepted_sequence=")
+    if not (
+        parts[1].startswith("delivery_generation=")
+        and parts[2].startswith("accepted_sequence=")
+        and generation.isascii()
+        and generation.isdigit()
+        and sequence.isascii()
+        and sequence.isdigit()
+        and len(generation) <= 20
+        and len(sequence) <= 20
+    ):
+        return None
+    return int(generation), int(sequence)
+
 
 class Sensor:
     """Async facade for a single sensor device.
@@ -28,8 +51,8 @@ class Sensor:
 
     **Lifecycle**
 
-    ``destroy`` stops callback tasks first, then calls ``driver.destroy()`` so
-    parsing and publishing cease before the outbound data buffer is closed.
+    ``destroy`` drains a running stream before stopping callbacks and tearing
+    down the driver. Failed drains remain explicit even though cleanup proceeds.
     """
 
     def __init__(self, address: str, driver: Driver, *, adapter_id: str | None = None) -> None:
@@ -43,6 +66,13 @@ class Sensor:
         self._cached_battery: int = -1
 
         self._callback_lock = asyncio.Lock()
+        self._data_callback_idle = asyncio.Event()
+        self._data_callback_idle.set()
+        self._settled_data_sequence = 0
+        self._callback_failure_count = 0
+        self._completed_fault_generation = -1
+        self._fault_progress = asyncio.Event()
+        self._fault_pending_callback: Callable[[str], Any] | None = None
         self._logger = logging.getLogger(__name__)
 
     @property
@@ -118,10 +148,35 @@ class Sensor:
         self._cached_battery = await self.get_battery_level()
 
     async def start_streaming(self) -> None:
+        boundary = self._driver.scientific_fault_boundary
+        if boundary is not None:
+            async with asyncio.timeout(SCIENTIFIC_FAULT_DRAIN_TIMEOUT_SECONDS):
+                while (
+                    self._error_callback_task is not None and self._completed_fault_generation < boundary[0]
+                ) or self._settled_data_sequence < boundary[1]:
+                    self._fault_progress.clear()
+                    if self._error_callback_task is not None and self._error_callback_task.done():
+                        raise RuntimeError("Previous stream fault was not delivered")
+                    if self._settled_data_sequence < boundary[1] and (
+                        self._data_callback_task is None or self._data_callback_task.done()
+                    ):
+                        raise RuntimeError("Previous sensor stream still has undelivered data")
+                    await self._fault_progress.wait()
+        self._callback_failure_count = 0
         await self._driver.start_streaming()
 
     async def stop_streaming(self) -> None:
         await self._driver.stop_streaming()
+        if self._data_callback_task is not None:
+            try:
+                async with asyncio.timeout(5.0):
+                    while self._driver.pending_data_packets or not self._data_callback_idle.is_set():
+                        if self._data_callback_task.done():
+                            raise RuntimeError("Sensor data callback stopped before delivery drained")
+                        await asyncio.sleep(0.001)
+            except Exception as error:
+                self._driver.report_scientific_delivery_fault(f"stage=callback_stop_drain|error={type(error).__name__}")
+                raise
 
     async def _dispatch_callback(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a user callback without blocking the driver event loop.
@@ -140,11 +195,28 @@ class Sensor:
         """Consume :meth:`~synchroni_sensor_sdk.async_api.driver.base.Driver.data_notifications`."""
         try:
             async for data in self._driver.data_notifications():
-                await self._dispatch_callback(callback, data)
+                self._data_callback_idle.clear()
+                try:
+                    await self._dispatch_callback(callback, data)
+                except (Exception, asyncio.CancelledError) as error:
+                    self._callback_failure_count += 1
+                    self._logger.exception("Error handling data notification")
+                    self._driver.report_scientific_delivery_fault(
+                        f"stage=data_callback|error={type(error).__name__}"
+                        f"|packet_counter={data.last_package_counter}|received_monotonic_ns={data.received_monotonic_ns}"
+                    )
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                finally:
+                    if data.delivery_sequence is not None:
+                        self._settled_data_sequence = max(self._settled_data_sequence, data.delivery_sequence)
+                    self._fault_progress.set()
+                    self._data_callback_idle.set()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             self._logger.exception("Error handling data notifications")
+            self._driver.report_scientific_delivery_fault(f"stage=data_notifications|error={type(error).__name__}")
 
     async def _handle_power_notifications(self, callback: Callable[[int], Any]) -> None:
         """Consume :meth:`~synchroni_sensor_sdk.async_api.driver.base.Driver.power_notifications`."""
@@ -171,11 +243,43 @@ class Sensor:
         """Consume :meth:`~synchroni_sensor_sdk.async_api.driver.base.Driver.error_notifications`."""
         try:
             async for error in self._driver.error_notifications():
+                boundary = _scientific_fault_boundary(error)
+                if error.startswith("SDK_SCIENTIFIC_DELIVERY_FAULT|") and boundary is not None:
+                    # Surface the fault immediately, then serialize its final boundary
+                    # after every previously accepted data callback has settled.
+                    if self._fault_pending_callback is not None:
+                        try:
+                            await self._dispatch_callback(self._fault_pending_callback, error)
+                        except Exception:
+                            self._logger.exception("Error announcing pending scientific fault")
+                    settled = False
+                    try:
+                        async with asyncio.timeout(SCIENTIFIC_FAULT_DRAIN_TIMEOUT_SECONDS):
+                            while self._settled_data_sequence < boundary[1]:
+                                self._fault_progress.clear()
+                                if self._data_callback_task is None or self._data_callback_task.done():
+                                    raise RuntimeError("Data callback unavailable at fault boundary")
+                                await self._fault_progress.wait()
+                        settled = True
+                    except (TimeoutError, RuntimeError):
+                        self._logger.error("Scientific fault boundary could not completely drain")
+                    error += (
+                        f"|boundary_settled={str(settled).lower()}"
+                        f"|settled_sequence={self._settled_data_sequence}"
+                        f"|callback_failure_count={self._callback_failure_count}"
+                    )
                 await self._dispatch_callback(callback, error)
+                if boundary is not None and error.startswith("SDK_SCIENTIFIC_DELIVERY_FAULT|"):
+                    self._completed_fault_generation = max(self._completed_fault_generation, boundary[0])
+                    self._fault_progress.set()
         except asyncio.CancelledError:
             raise
         except Exception:
             self._logger.exception("Error handling error notifications")
+
+    async def register_scientific_fault_pending_callback(self, callback: Callable[[str], Any]) -> None:
+        """Optional immediate fault status; ordinary error callback carries the ordered boundary."""
+        self._fault_pending_callback = callback
 
     async def _await_task(self, task: asyncio.Task[None] | None) -> None:
         """Wait for a callback task to finish after cancellation."""
@@ -252,9 +356,13 @@ class Sensor:
         await self._driver.system_reset()
 
     async def destroy(self) -> None:
-        """Release callbacks then tear down the driver.
+        """Drain a running stream, then release callbacks and tear down the driver.
 
         See :meth:`~synchroni_sensor_sdk.async_api.driver.base.Driver.destroy`.
         """
-        await self._cancel_callback_tasks()
-        await self._driver.destroy()
+        try:
+            if self.is_streaming():
+                await self.stop_streaming()
+        finally:
+            await self._cancel_callback_tasks()
+            await self._driver.destroy()

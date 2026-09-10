@@ -6,7 +6,7 @@ import platform
 import struct
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any, TextIO
 
@@ -18,10 +18,12 @@ from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
     DataSubscription,
     GForceProtocol,
     ImuRawDataConfig,
+    RawDataPacket,
     ResponseCode,
     SampleResolution,
     SamplingRate,
     decode_cap_fs_bitmask,
+    decode_emg_cap_fs_bitmask,
 )
 from synchroni_sensor_sdk.core.data import SensorData as PublicSensorData
 from synchroni_sensor_sdk.core.device import DeviceParams, native_device_profile
@@ -63,6 +65,23 @@ class SensorDataType(IntEnum):
     DATA_TYPE_COUNT = 14
 
 
+_REORDER_SENSOR_TYPE_BY_NOTIFICATION = {
+    int(DataType.NTF_ACC): SensorDataType.DATA_TYPE_ACC,
+    int(DataType.NTF_GYRO): SensorDataType.DATA_TYPE_GYRO,
+    int(DataType.NTF_EULER_DATA): SensorDataType.DATA_TYPE_EULER,
+    int(DataType.NTF_QUATERNION): SensorDataType.DATA_TYPE_QUATERNION,
+    int(DataType.NTF_GEST): SensorDataType.DATA_TYPE_GEST,
+    int(DataType.NTF_EMG): SensorDataType.DATA_TYPE_EMG,
+    int(DataType.NTF_MAG_ANGLE_DATA): SensorDataType.DATA_TYPE_MAG_ANGLE,
+    int(DataType.NTF_EEG): SensorDataType.DATA_TYPE_EEG,
+    int(DataType.NTF_ECG): SensorDataType.DATA_TYPE_ECG,
+    int(DataType.NTF_IMU): SensorDataType.DATA_TYPE_ACC,
+    int(DataType.NTF_BRTH): SensorDataType.DATA_TYPE_BRTH,
+    int(DataType.NTF_SPO2): SensorDataType.DATA_TYPE_SPO2,
+    int(DataType.NTF_PPG): SensorDataType.DATA_TYPE_PPG,
+}
+
+
 # 枚举 FeatureMaps 的 Python 实现 / Python implementation of FeatureMaps enum (feature flags).
 class FeatureMaps(Enum):
     GFD_FEAT_GEST = 0x000001000
@@ -89,11 +108,21 @@ class PPGDataMode(IntEnum):
 
 
 _MAX_ALLOWED_PACKAGE_INDEX_DELTA = 50
-_WATCHDOG_STALL_S = 5.0
+_PACKET_REORDER_MAX_FORWARD_DISTANCE = 64
+_PACKET_REORDER_MAX_PENDING = 64
+_PACKET_REORDER_TIMEOUT_NS = 200_000_000
+_INGRESS_DIAGNOSTIC_LOG_INTERVAL_NS = 60_000_000_000
 _EMG_CONFIG_WRITE_ATTEMPTS = 2
 _NEW_EMG_FUNCTION_SWITCH_SETTLE_S = 0.5
 _GFORCE_ULTRA_500_HZ_COMPAT_READBACK_HZ = 1000
 _GFORCE_ULTRA_REQUIRED_MANAGED_ATT_MTU = 247
+_CONFIGURABLE_EEG_SAMPLE_RATES = frozenset({250, 500})
+_CONFIGURABLE_EMG_SAMPLE_RATES = frozenset(
+    {
+        SamplingRate.HZ_500,
+        SamplingRate.HZ_1000,
+    }
+)
 _EMG_BYTES_PER_CHANNEL_VALUE = {
     0: 2,  # New-EMG train/compressed value.
     7: 1,  # Legacy signed 8-bit value with the device's 119 offset.
@@ -102,6 +131,15 @@ _EMG_BYTES_PER_CHANNEL_VALUE = {
     16: 2,
     24: 3,
 }
+
+
+@dataclass
+class _PacketReorderState:
+    modulus: int
+    last_released_index: int | None = None
+    last_released_received_ns: int = 0
+    pending: dict[int, RawDataPacket] = field(default_factory=dict)
+    deadline_ns: int | None = None
 
 
 def _emg_sample_count_from_payload(payload_byte_count: int, sensor_data: SensorData) -> int | None:
@@ -137,18 +175,25 @@ class DataContext:
     """
 
     @staticmethod
-    def _drain_queue(q: asyncio.Queue[bytes]) -> None:
+    def _drain_queue(q: asyncio.Queue[RawDataPacket]) -> None:
         while not q.empty():
             try:
                 q.get_nowait()
+                q.task_done()
             except asyncio.QueueEmpty:
                 break
+
+    @staticmethod
+    def _raw_packet(value: RawDataPacket | bytes | bytearray) -> RawDataPacket:
+        if isinstance(value, RawDataPacket):
+            return value
+        return RawDataPacket(data=bytes(value), received_monotonic_ns=time.monotonic_ns())
 
     def __init__(
         self,
         gForce: GForceProtocol,
         deviceMac: str,
-        buf: asyncio.Queue[bytes],
+        buf: asyncio.Queue[RawDataPacket],
         *,
         publish_data: Callable[[PublicSensorData], None],
         on_error: Callable[[str], None] | None = None,
@@ -165,17 +210,30 @@ class DataContext:
         self._is_running: bool = True
         self._is_data_transfering: bool = False
         self.isUniversalStream: bool = gForce._is_universal_stream
-        self._rawDataBuffer: asyncio.Queue[bytes] = buf
+        self._rawDataBuffer: asyncio.Queue[RawDataPacket] = buf
         self._publish_data = publish_data
+        self._deferred_publications: list[PublicSensorData] | None = None
         self._on_error = on_error
         self._concatDataBuffer: bytearray = bytearray()
+        self._packet_reorder_states: dict[int, _PacketReorderState] = {}
+        self._current_packet_received_monotonic_ns: int = 0
+        self._reordered_packet_count: int = 0
+        self._reorder_timeout_count: int = 0
+        self._stale_packet_count: int = 0
+        self._raw_ingress_packet_count: int = 0
+        self._parsed_packet_count: int = 0
+        self._parse_error_count: int = 0
+        self._max_raw_queue_depth: int = 0
+        self._last_ingress_diagnostic_ns: int = time.monotonic_ns()
 
         self.isNewEMG: bool = False
         self.isContainQAT6: bool = False
-        # ``None`` preserves the device's native rate.
+        # ``None`` preserves the device's native rate. Recorder selects an
+        # explicit rate before init only for products that expose that control.
         self._eeg_sample_rate: int | None = None
         self._eeg_capability_sample_rates: tuple[int, ...] = ()
         self._emg_sample_rate: SamplingRate | None = None
+        self._emg_capability_sample_rates: tuple[int, ...] = ()
         self.ppgModel: PPGDataMode = PPGDataMode.PPG_AND_SPO2
         self._last_progress_time: float = 0.0
         self._watchdog_restart_pending: bool = False
@@ -185,7 +243,6 @@ class DataContext:
             self.sensorDatas.append(SensorData())
         self.impedanceData: list[float] = []
         self.saturationData: list[float] = []
-        self.dataPool: ThreadPoolExecutor = ThreadPoolExecutor(1, "data")
         self.init_map: dict[NtfParam, ParamToggle] = dict(DEFAULT_NTF_PARAMS)
         # Match legacy defaults: non-RFSTAR devices leave IMU off until explicit enable.
         if not self.isUniversalStream:
@@ -198,6 +255,332 @@ class DataContext:
         self._debug_csv_file: TextIO | None = None
         self.debugCSVPath: str | None = None
 
+    def _packet_sequence(self, packet: RawDataPacket) -> tuple[int, int, int] | None:
+        data = packet.data
+        if not data:
+            return None
+        notification_type = data[0] & 0x7F
+        sensor_type = _REORDER_SENSOR_TYPE_BY_NOTIFICATION.get(notification_type)
+        if sensor_type is None:
+            return None
+        sensor_data = self.sensorDatas[sensor_type]
+        index_length = int(sensor_data.packageIndexLength)
+        if index_length not in (1, 2) or len(data) < 1 + index_length:
+            return None
+        package_index = int.from_bytes(data[1 : 1 + index_length], byteorder="little", signed=False)
+        return notification_type, package_index, 1 << (8 * index_length)
+
+    @staticmethod
+    def _forward_distance(state: _PacketReorderState, package_index: int) -> int | None:
+        if state.last_released_index is None:
+            return None
+        return (package_index - state.last_released_index) % state.modulus
+
+    @staticmethod
+    def _packet_reorder_deadline_ns(packet: RawDataPacket, fallback_ns: int) -> int:
+        """Expire from BLE receipt, not from however late the parser runs."""
+        received_ns = packet.received_monotonic_ns if packet.received_monotonic_ns > 0 else fallback_ns
+        return received_ns + _PACKET_REORDER_TIMEOUT_NS
+
+    @classmethod
+    def _pending_reorder_deadline_ns(cls, state: _PacketReorderState, fallback_ns: int) -> int:
+        if not state.pending:
+            return fallback_ns + _PACKET_REORDER_TIMEOUT_NS
+        return min(cls._packet_reorder_deadline_ns(packet, fallback_ns) for packet in state.pending.values())
+
+    @staticmethod
+    def _release_packet(
+        state: _PacketReorderState,
+        package_index: int,
+        packet: RawDataPacket,
+    ) -> RawDataPacket:
+        received_ns = max(packet.received_monotonic_ns, state.last_released_received_ns + 1)
+        state.last_released_index = package_index
+        state.last_released_received_ns = received_ns
+        return RawDataPacket(data=packet.data, received_monotonic_ns=received_ns)
+
+    def _drain_contiguous_pending(
+        self,
+        state: _PacketReorderState,
+        *,
+        recovered: bool,
+    ) -> list[RawDataPacket]:
+        released: list[RawDataPacket] = []
+        while state.last_released_index is not None:
+            expected = (state.last_released_index + 1) % state.modulus
+            packet = state.pending.pop(expected, None)
+            if packet is None:
+                break
+            released.append(self._release_packet(state, expected, packet))
+            if recovered:
+                self._reordered_packet_count += 1
+        if not state.pending:
+            state.deadline_ns = None
+        return released
+
+    @staticmethod
+    def _initial_pending_index(state: _PacketReorderState) -> int:
+        """Choose the start of the smallest modular arc containing every packet.
+
+        Before the first packet is released there is no sequence frontier, so an
+        arrival-time choice can mistake ordinary notification reordering for a
+        backward packet.  Removing the largest circular gap gives the only
+        bounded ordering that retains every observed index, including rollover.
+        Genuine gaps inside that arc are then released through the normal loss
+        accounting path instead of causing an earlier valid packet to be dropped.
+        """
+        if not state.pending:
+            raise RuntimeError("Cannot initialize an empty packet reorder state")
+        ordered_indices = sorted(state.pending)
+        if len(ordered_indices) == 1:
+            return ordered_indices[0]
+
+        def gap_rank(position: int) -> tuple[int, int]:
+            next_index = ordered_indices[(position + 1) % len(ordered_indices)]
+            gap = (next_index - ordered_indices[position]) % state.modulus
+            # For the ambiguous equal-gap case, start with the packet that
+            # arrived first. This affects ordering only; no packet is discarded.
+            return gap, -state.pending[next_index].received_monotonic_ns
+
+        largest_gap_position = max(range(len(ordered_indices)), key=gap_rank)
+        return ordered_indices[(largest_gap_position + 1) % len(ordered_indices)]
+
+    def _expire_reorder_state(
+        self,
+        notification_type: int,
+        state: _PacketReorderState,
+        now_ns: int,
+        *,
+        force: bool,
+    ) -> list[RawDataPacket]:
+        released: list[RawDataPacket] = []
+        while state.pending and (force or state.deadline_ns is not None and now_ns >= state.deadline_ns):
+            if state.last_released_index is None:
+                package_index = self._initial_pending_index(state)
+                packet = state.pending.pop(package_index)
+                released.append(self._release_packet(state, package_index, packet))
+                released.extend(self._drain_contiguous_pending(state, recovered=False))
+                if state.pending:
+                    state.deadline_ns = self._pending_reorder_deadline_ns(state, now_ns)
+                if not force:
+                    break
+                continue
+
+            candidates = [
+                (distance, package_index, packet)
+                for package_index, packet in state.pending.items()
+                if (distance := self._forward_distance(state, package_index)) is not None
+                and 0 < distance < state.modulus // 2
+            ]
+            if not candidates:
+                self._stale_packet_count += len(state.pending)
+                state.pending.clear()
+                state.deadline_ns = None
+                break
+            _distance, package_index, packet = min(candidates, key=lambda item: item[0])
+            state.pending.pop(package_index, None)
+            self._reorder_timeout_count += 1
+            self._logger.warning(
+                "Packet reorder window expired for %s type %s; releasing index %s after %s; "
+                "raw_queue=%s max_raw_queue=%s pending_reorder=%s",
+                self.deviceMac,
+                notification_type,
+                package_index,
+                state.last_released_index,
+                self._rawDataBuffer.qsize(),
+                self._max_raw_queue_depth,
+                len(state.pending),
+            )
+            released.append(self._release_packet(state, package_index, packet))
+            released.extend(self._drain_contiguous_pending(state, recovered=False))
+            if state.pending:
+                state.deadline_ns = self._pending_reorder_deadline_ns(state, now_ns)
+            if not force:
+                break
+        return released
+
+    def _flush_reorder_states(self, now_ns: int, *, force: bool = False) -> list[RawDataPacket]:
+        released: list[RawDataPacket] = []
+        for notification_type, state in self._packet_reorder_states.items():
+            released.extend(
+                self._expire_reorder_state(
+                    notification_type,
+                    state,
+                    now_ns,
+                    force=force,
+                )
+            )
+        return released
+
+    def _ordered_packets(
+        self,
+        packet: RawDataPacket,
+        now_ns: int,
+        *,
+        expire_pending: bool = True,
+    ) -> list[RawDataPacket]:
+        # Parser backlog can exceed the reorder deadline even when the missing
+        # packet is already waiting in the raw ingress queue. Production drains
+        # that queue with ``expire_pending=False`` before declaring a gap.
+        released = self._flush_reorder_states(now_ns) if expire_pending else []
+        sequence = self._packet_sequence(packet)
+        if sequence is None:
+            released.append(packet)
+            return released
+
+        notification_type, package_index, modulus = sequence
+        state = self._packet_reorder_states.get(notification_type)
+        if state is None or state.modulus != modulus:
+            state = _PacketReorderState(modulus=modulus)
+            self._packet_reorder_states[notification_type] = state
+
+        distance = self._forward_distance(state, package_index)
+        if distance is None:
+            state.pending.setdefault(package_index, packet)
+            packet_deadline_ns = self._packet_reorder_deadline_ns(packet, now_ns)
+            state.deadline_ns = (
+                packet_deadline_ns if state.deadline_ns is None else min(state.deadline_ns, packet_deadline_ns)
+            )
+            if len(state.pending) >= _PACKET_REORDER_MAX_PENDING:
+                released.extend(self._expire_reorder_state(notification_type, state, now_ns, force=True))
+            return released
+        if distance == 0:
+            self._stale_packet_count += 1
+            return released
+        if distance == 1:
+            released.append(self._release_packet(state, package_index, packet))
+            released.extend(self._drain_contiguous_pending(state, recovered=True))
+            return released
+        if distance >= modulus // 2:
+            self._stale_packet_count += 1
+            self._logger.warning(
+                "Dropping stale buffered packet index %s after %s for %s",
+                package_index,
+                state.last_released_index,
+                notification_type,
+            )
+            return released
+
+        if distance <= _PACKET_REORDER_MAX_FORWARD_DISTANCE:
+            state.pending.setdefault(package_index, packet)
+            packet_deadline_ns = self._packet_reorder_deadline_ns(packet, now_ns)
+            state.deadline_ns = (
+                packet_deadline_ns if state.deadline_ns is None else min(state.deadline_ns, packet_deadline_ns)
+            )
+            if len(state.pending) <= _PACKET_REORDER_MAX_PENDING:
+                return released
+
+        # A jump outside the small reorder window is genuine enough to pass to
+        # checkReadSamples immediately. Flush older pending packets first so
+        # the existing loss accounting remains exact and ordered.
+        released.extend(self._expire_reorder_state(notification_type, state, now_ns, force=True))
+        distance = self._forward_distance(state, package_index)
+        if distance is not None and distance >= modulus // 2:
+            self._stale_packet_count += 1
+            return released
+        released.append(self._release_packet(state, package_index, packet))
+        released.extend(self._drain_contiguous_pending(state, recovered=False))
+        return released
+
+    def _process_ordered_packet(self, packet: RawDataPacket) -> None:
+        try:
+            self._processDataPackage(
+                packet.data,
+                received_monotonic_ns=packet.received_monotonic_ns,
+            )
+        except Exception as error:
+            self._record_parse_error(error, packet)
+        else:
+            self._parsed_packet_count += 1
+
+    def _process_ingress_packet(self, packet: RawDataPacket, *, expire_pending: bool = True) -> None:
+        for ordered in self._ordered_packets(
+            packet,
+            time.monotonic_ns(),
+            expire_pending=expire_pending,
+        ):
+            self._process_ordered_packet(ordered)
+
+    def _process_flushed_reorder_packets(self, *, force: bool = False) -> None:
+        now_ns = time.monotonic_ns()
+        for ordered in self._flush_reorder_states(now_ns, force=force):
+            self._process_ordered_packet(ordered)
+
+    async def _process_packets_fairly(self, packets: list[RawDataPacket]) -> None:
+        """Yield for every public output, including multi-output reorder bursts."""
+        for packet in packets:
+            self._deferred_publications = []
+            try:
+                self._process_ordered_packet(packet)
+                publications = self._deferred_publications
+            finally:
+                self._deferred_publications = None
+            for publication in publications:
+                self._publish_data(publication)
+                await asyncio.sleep(0)
+
+    async def _flush_reorder_fairly(self, *, force: bool = False) -> None:
+        await self._process_packets_fairly(self._flush_reorder_states(time.monotonic_ns(), force=force))
+
+    async def _process_ingress_fairly(self, packet: RawDataPacket) -> None:
+        self._deferred_publications = []
+        try:
+            self._process_ingress_packet(packet, expire_pending=False)
+            publications = self._deferred_publications
+        finally:
+            self._deferred_publications = None
+        for publication in publications:
+            self._publish_data(publication)
+            await asyncio.sleep(0)
+
+    def _record_parse_error(self, error: Exception, packet: RawDataPacket | None) -> None:
+        self._parse_error_count += 1
+        if self._is_data_transfering and self._parse_error_count == 1 and self._on_error is not None:
+            self._on_error(
+                "SDK_SCIENTIFIC_DELIVERY_FAULT|stage=parser|"
+                f"error={type(error).__name__}|received_monotonic_ns="
+                f"{packet.received_monotonic_ns if packet is not None else 0}"
+            )
+        if self._parse_error_count > 5 and self._parse_error_count % 100 != 0:
+            return
+        notification_type = packet.data[0] & 0x7F if packet is not None and packet.data else None
+        packet_size = len(packet.data) if packet is not None else 0
+        self._logger.warning(
+            "SDK packet parse failure for %s: notification_type=%s bytes=%s total_errors=%s: %s",
+            self.deviceMac,
+            notification_type,
+            packet_size,
+            self._parse_error_count,
+            error,
+            exc_info=True,
+        )
+
+    def _maybe_log_ingress_diagnostics(self, *, force: bool = False) -> None:
+        now_ns = time.monotonic_ns()
+        if not force and not self._is_data_transfering:
+            return
+        if not force and now_ns - self._last_ingress_diagnostic_ns < _INGRESS_DIAGNOSTIC_LOG_INTERVAL_NS:
+            return
+        self._last_ingress_diagnostic_ns = now_ns
+        pending_reorder_packets = sum(len(state.pending) for state in self._packet_reorder_states.values())
+        lost_packets = sum(max(0, int(sensor_data.lostPackageCount)) for sensor_data in self.sensorDatas)
+        self._logger.info(
+            "SDK ingress diagnostics mac=%s raw_packets=%s parsed_packets=%s "
+            "raw_queue=%s max_raw_queue=%s pending_reorder=%s recovered=%s "
+            "expired_gaps=%s stale_or_duplicate=%s parse_errors=%s lost_packets=%s",
+            self.deviceMac,
+            self._raw_ingress_packet_count,
+            self._parsed_packet_count,
+            self._rawDataBuffer.qsize(),
+            self._max_raw_queue_depth,
+            pending_reorder_packets,
+            self._reordered_packet_count,
+            self._reorder_timeout_count,
+            self._stale_packet_count,
+            self._parse_error_count,
+            lost_packets,
+        )
+
     def abort_streaming(self) -> None:
         """Stop accepting samples without sending BLE stop commands.
 
@@ -205,6 +588,8 @@ class DataContext:
         :meth:`stop_streaming` would fail; prevents :meth:`checkReadSamples`
         from processing further packets.
         """
+        if self._is_data_transfering:
+            self._maybe_log_ingress_diagnostics(force=True)
         self._is_data_transfering = False
 
     def close(self) -> None:
@@ -226,6 +611,16 @@ class DataContext:
         self.impedanceData.clear()
         self.saturationData.clear()
         self._concatDataBuffer.clear()
+        self._packet_reorder_states.clear()
+        self._current_packet_received_monotonic_ns = 0
+        self._reordered_packet_count = 0
+        self._reorder_timeout_count = 0
+        self._stale_packet_count = 0
+        self._raw_ingress_packet_count = 0
+        self._parsed_packet_count = 0
+        self._parse_error_count = 0
+        self._max_raw_queue_depth = 0
+        self._last_ingress_diagnostic_ns = time.monotonic_ns()
         self._drain_queue(self._rawDataBuffer)
 
     def reset(self) -> None:
@@ -289,6 +684,7 @@ class DataContext:
 
     def supported_streams(self) -> frozenset[str]:
         """Return public stream names supported by the connected firmware."""
+        supported: set[str] = set()
         checks = (
             ("emg", self.hasEMG),
             ("eeg", self.hasEEG),
@@ -305,7 +701,10 @@ class DataContext:
             ("acc", self.hasAcc),
             ("gyro", self.hasGyro),
         )
-        return frozenset(name for name, check in checks if check())
+        for name, check in checks:
+            if check():
+                supported.add(name)
+        return frozenset(supported)
 
     def _ntf_on(self, key: NtfParam) -> bool:
         return self.init_map.get(key, ParamToggle.OFF) == ParamToggle.ON
@@ -378,11 +777,14 @@ class DataContext:
 
     async def initEMG(self, packageCount: int) -> int:
         config = await self.gForce.get_emg_raw_data_config()
-        profile_id = self._native_profile_id()
-        is_ultra = profile_id == "force_ultra"
+        native_profile = native_device_profile(
+            getattr(self._device_info, "DeviceName", ""),
+            getattr(self._device_info, "ModelName", ""),
+        )
+        is_ultra = native_profile is not None and native_profile.profile_id == "force_ultra"
         # A selected raw-stream rate is authoritative for both gForcePro and
         # gForce Ultra. OYMotion publishes Ultra as 1000 Hz while its Python
-        # init path hardcodes 500 Hz, so the SDK exposes and preserves both.
+        # init path hardcodes 500 Hz, so Recorder exposes and preserves both.
         sample_rate = self._emg_sample_rate
         if sample_rate is None:
             sample_rate = SamplingRate.HZ_500 if is_ultra else config.fs
@@ -394,9 +796,16 @@ class DataContext:
                     "gForce Ultra requires managed-USB ATT MTU 247 for its 240-byte EMG frame, "
                     f"but this connection negotiated {negotiated_mtu}; power-cycle the armband/dongle and reconnect"
                 )
+        self._emg_capability_sample_rates = ()
+        if is_ultra:
+            try:
+                capability = await self.gForce.get_emg_raw_data_cap()
+                self._emg_capability_sample_rates = decode_emg_cap_fs_bitmask(int(capability.fs))
+            except Exception as error:
+                self._logger.debug("EMG sample-rate capability query is unavailable: %s", error)
         isNewEMG = True
         device_info = self._device_info
-        if profile_id in {"force", "force_oct"}:
+        if native_profile is not None and native_profile.profile_id in {"force", "force_oct"}:
             isNewEMG = False
         elif not is_ultra and device_info is not None:
             device_name = device_info.DeviceName
@@ -411,6 +820,9 @@ class DataContext:
         self.isNewEMG = isNewEMG
 
         if isNewEMG:
+            # new emg
+            gain = 6
+            conversion_factor = 4000000.0 / 8388607.0 / gain
             package_index_length = 2
             ultra_1000_hz = is_ultra and sample_rate == SamplingRate.HZ_1000
             # OYWW transports its 24-bit ADC through logarithmically compressed
@@ -420,12 +832,18 @@ class DataContext:
             resolution_bits = 8 if ultra_1000_hz else 0
             config.resolution = SampleResolution.BITS_8
         else:
+            # old emg
+            gain = 1200
+            min_voltage = -1.25 * 1000000
+            max_voltage = 1.25 * 100000
             package_index_length = 1
             # gForcePro+ exposes 500 Hz at 12-bit and 1000 Hz at 8-bit.
             config.resolution = (
                 SampleResolution.BITS_12 if sample_rate == SamplingRate.HZ_500 else SampleResolution.BITS_8
             )
             resolution_bits = int(config.resolution)
+            div = 2047.0 if resolution_bits == 12 else 127.0
+            conversion_factor = (max_voltage - min_voltage) / gain / div
 
         config.fs = sample_rate
         config.channel_mask = 255
@@ -442,7 +860,20 @@ class DataContext:
             sample_rate,
             accept_ultra_500_hz_compat_readback=is_ultra,
         )
+        if is_ultra:
+            self._validate_ultra_emg_config(actual_config, sample_rate)
         actual_rate = self._effective_emg_delivery_rate(sample_rate, actual_config.fs)
+        if not isNewEMG:
+            actual_resolution = int(actual_config.resolution)
+            expected_resolution = 12 if actual_rate == 500 else 8
+            if actual_resolution != expected_resolution:
+                raise RuntimeError(
+                    f"EMG resolution readback was {actual_resolution}-bit, expected {expected_resolution}-bit "
+                    f"at {actual_rate} Hz"
+                )
+            resolution_bits = 12 if actual_resolution == 12 else 7
+            div = 2047.0 if resolution_bits == 12 else 127.0
+            conversion_factor = (max_voltage - min_voltage) / gain / div
         self._emg_sample_rate = SamplingRate(actual_rate)
         await self.gForce.set_package_id(True)
 
@@ -452,14 +883,15 @@ class DataContext:
         data.sampleRate = actual_rate
         data.resolutionBits = resolution_bits
         data.channelCount = 8
+        data.channelMask = actual_config.channel_mask
         data.minPackageSampleCount = packageCount
         data.packageIndexLength = package_index_length
-        data.K = 4_000_000.0 / 8_388_607.0 / 6 if isNewEMG else 0.0
+        data.K = conversion_factor
         self._apply_emg_packet_layout(
             data,
             actual_config,
             self._emg_sample_rate,
-            profile_id,
+            native_profile.profile_id if native_profile is not None else None,
             legacy_emg=not isNewEMG,
         )
         # The received packet calculation below replaces this configuration
@@ -562,15 +994,19 @@ class DataContext:
                 )
         raise RuntimeError(f"EMG sample-rate readback was {int(actual_config.fs)} Hz, expected {expected_rate} Hz")
 
-    def _native_profile_id(self) -> str | None:
+    def _is_gforce_ultra(self) -> bool:
         profile = native_device_profile(
             getattr(self._device_info, "DeviceName", ""),
             getattr(self._device_info, "ModelName", ""),
         )
-        return profile.profile_id if profile is not None else None
+        return profile is not None and profile.profile_id == "force_ultra"
 
-    def _is_gforce_ultra(self) -> bool:
-        return self._native_profile_id() == "force_ultra"
+    def _is_legacy_force(self) -> bool:
+        profile = native_device_profile(
+            getattr(self._device_info, "DeviceName", ""),
+            getattr(self._device_info, "ModelName", ""),
+        )
+        return profile is not None and profile.profile_id in {"force", "force_oct"}
 
     def _effective_emg_delivery_rate(self, requested: SamplingRate, reported: SamplingRate) -> int:
         if (
@@ -978,18 +1414,35 @@ class DataContext:
         if not self._is_data_transfering:
             return True
 
-        self._is_data_transfering = False
-
         try:
             if not self.isUniversalStream:
                 await self.gForce.stop_streaming()
             else:
                 await self.gForce.set_subscription(DataSubscription.OFF)
 
-            while self._is_running and not self._rawDataBuffer.empty():
-                await asyncio.sleep(0.1)
+            # Stop ingress before disabling parsing. The queue join includes
+            # the raw packet currently being parsed and its public handoff.
+            async with asyncio.timeout(5.0):
+                drain_ingress = getattr(self.gForce, "drain_raw_ingress", None)
+                if drain_ingress is not None:
+                    await drain_ingress()
+                await self._rawDataBuffer.join()
+                await self._flush_reorder_fairly(force=True)
+                for sensor_data in self.sensorDatas:
+                    if sensor_data.channelSamples and sensor_data.channelSamples[0]:
+                        original_batch_size = sensor_data.minPackageSampleCount
+                        sensor_data.minPackageSampleCount = len(sensor_data.channelSamples[0])
+                        try:
+                            self.sendSensorData(sensor_data)
+                        finally:
+                            sensor_data.minPackageSampleCount = original_batch_size
+                        await asyncio.sleep(0)
+            self._maybe_log_ingress_diagnostics(force=True)
+            self._is_data_transfering = False
 
         except Exception as e:
+            if self._on_error is not None:
+                self._on_error(f"SDK_SCIENTIFIC_DELIVERY_FAULT|stage=stop_drain|error={type(e).__name__}")
             raise DataContextStopStreamingError(f"Failed to stop streaming: {e}") from e
 
         return True
@@ -1025,12 +1478,25 @@ class DataContext:
 
     async def set_emg_sample_rate(self, sample_rate_hz: int, *, apply_to_device: bool) -> None:
         """Select a configurable EMG rate and keep parser/device metadata consistent."""
-        if sample_rate_hz not in (500, 1000):
+        try:
+            sample_rate = SamplingRate(sample_rate_hz)
+        except ValueError as error:
+            raise ValueError("EMG sample rate must be 500 or 1000 Hz") from error
+        if sample_rate not in _CONFIGURABLE_EMG_SAMPLE_RATES:
             raise ValueError("EMG sample rate must be 500 or 1000 Hz")
-        sample_rate = SamplingRate(sample_rate_hz)
-        profile_id = self._native_profile_id()
-        is_ultra = profile_id == "force_ultra"
-        is_legacy_force = profile_id in {"force", "force_oct"}
+        is_ultra = self._is_gforce_ultra()
+        is_legacy_force = self._is_legacy_force()
+        if (
+            self._emg_capability_sample_rates
+            and int(sample_rate) not in self._emg_capability_sample_rates
+            and not is_ultra
+        ):
+            self._logger.warning(
+                "EMG capability does not advertise %s Hz (reported %s); attempting the selected rate and using "
+                "verified readback as authority",
+                int(sample_rate),
+                self._emg_capability_sample_rates,
+            )
         actual_config: Any | None = None
         if apply_to_device:
             config = await self.gForce.get_emg_raw_data_config()
@@ -1046,7 +1512,17 @@ class DataContext:
                 sample_rate,
                 accept_ultra_500_hz_compat_readback=is_ultra,
             )
+            if is_ultra:
+                self._validate_ultra_emg_config(actual_config, sample_rate)
             sample_rate = SamplingRate(self._effective_emg_delivery_rate(sample_rate, actual_config.fs))
+            if is_legacy_force:
+                expected_resolution = 12 if sample_rate == SamplingRate.HZ_500 else 8
+                actual_resolution = int(actual_config.resolution)
+                if actual_resolution != expected_resolution:
+                    raise RuntimeError(
+                        f"EMG resolution readback was {actual_resolution}-bit, expected {expected_resolution}-bit "
+                        f"at {int(sample_rate)} Hz"
+                    )
         self._emg_sample_rate = sample_rate
         emg_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
         if emg_data.sampleRate > 0:
@@ -1057,7 +1533,7 @@ class DataContext:
                     emg_data,
                     actual_config,
                     sample_rate,
-                    profile_id,
+                    "force_ultra" if is_ultra else None,
                     legacy_emg=is_legacy_force,
                 )
         if self._device_info is not None and self._device_info.EmgChannelCount > 0:
@@ -1065,7 +1541,7 @@ class DataContext:
 
     async def set_eeg_sample_rate(self, sample_rate_hz: int, *, apply_to_device: bool) -> None:
         """Select the bound EEG/ECG rate published by sensor-sdk 0.9.6."""
-        if sample_rate_hz not in (250, 500):
+        if sample_rate_hz not in _CONFIGURABLE_EEG_SAMPLE_RATES:
             raise ValueError("EEG sample rate must be 250 or 500 Hz")
         if self._eeg_capability_sample_rates and sample_rate_hz not in self._eeg_capability_sample_rates:
             raise ValueError(
@@ -1107,95 +1583,100 @@ class DataContext:
 
     ####################################################################################
 
-    async def process_data(self) -> None:
-        """Parser loop for standard (non-CONCAT_BLE) devices.
+    async def _process_framed_packet(self, packet: RawDataPacket, *, universal: bool) -> None:
+        """Scan once and retain only an incomplete bounded wire frame.
 
-        Scheduled as ``GForceDriver._process_task`` at connect. Drains
-        ``_rawDataBuffer`` on the driver loop; optional CONCAT_BLE reassembly
-        runs inline when that subscription flag is set.
+        The length byte limits a complete frame to 259 bytes. Invalid prefixes
+        and CRC failures are discarded as framing evidence, never retained and
+        rescanned for the entire recording. A fragmented valid frame is kept.
         """
-        while self._is_running:
-            while self._is_running and self._rawDataBuffer.empty():
-                await asyncio.sleep(0.01)
-                if (
-                    self._is_data_transfering
-                    and self._last_progress_time > 0
-                    and (time.monotonic() - self._last_progress_time) > _WATCHDOG_STALL_S
-                ):
-                    self._logger.warning("Data parse stall detected; clearing assemble buffers")
-                    self._concatDataBuffer.clear()
-                    self._drain_queue(self._rawDataBuffer)
-                    for sensor_data in self.sensorDatas:
-                        sensor_data.clear()
-                    self._last_progress_time = time.monotonic()
-            if not self._is_running:
+        self._concatDataBuffer.extend(packet.data)
+        index = 0
+        trailer_size = 2 if universal else 1
+        data = self._concatDataBuffer
+        while index < len(data):
+            header = data[index]
+            if header != 0x55 and not (universal and header == 0xAA):
+                index += 1
+                continue
+            if index + 1 >= len(data):
                 break
+            size = data[index + 1]
+            if size < 2:
+                index += 1
+                continue
+            end = index + 2 + size + trailer_size
+            if end > len(data):
+                break
+            payload = bytes(data[index + 2 : index + 2 + size])
+            observed_crc = int.from_bytes(data[index + 2 + size : end], "little")
+            expected_crc = crc16_cal(payload, size) if universal else calc_crc8(payload)
+            if observed_crc != expected_crc:
+                index += 1
+                continue
+            index = end
+            if header == 0xAA:
+                if not _terminated:
+                    await self.gForce.async_on_cmd_response(payload)
+            elif self._is_data_transfering:
+                await self._process_ingress_fairly(RawDataPacket(payload, packet.received_monotonic_ns))
+        del data[:index]
 
+    async def _process_raw_queue(self, *, universal: bool) -> None:
+        while self._is_running:
             if self._watchdog_restart_pending:
                 self._watchdog_restart_pending = False
                 self._concatDataBuffer.clear()
+                self._packet_reorder_states.clear()
                 self._drain_queue(self._rawDataBuffer)
                 for sensor_data in self.sensorDatas:
                     sensor_data.clear()
-                self._last_progress_time = time.monotonic()
-
+            if self._rawDataBuffer.empty():
+                await asyncio.sleep(0.01)
+                if self._rawDataBuffer.empty():
+                    await self._flush_reorder_fairly()
+                continue
+            packet = None
             try:
-                while self._is_running and not self._rawDataBuffer.empty():
-                    data = self._rawDataBuffer.get_nowait()
+                packet = self._raw_packet(self._rawDataBuffer.get_nowait())
+                self._raw_ingress_packet_count += 1
+                self._max_raw_queue_depth = max(self._max_raw_queue_depth, self._rawDataBuffer.qsize() + 1)
+                if universal or self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE:
+                    await self._process_framed_packet(packet, universal=universal)
+                else:
+                    await self._process_ingress_fairly(packet)
+            except Exception as error:
+                self._record_parse_error(error, packet)
+            finally:
+                self._rawDataBuffer.task_done()
+            # One parser task, with a fair turn even for a packet that emitted
+            # no data. Backlog must drain before a reorder timeout declares loss.
+            await asyncio.sleep(0)
+            self._maybe_log_ingress_diagnostics()
 
-                    if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
-                        self._concatDataBuffer.extend(data)
-                    else:
-                        self._processDataPackage(data)
+    async def process_data(self) -> None:
+        """Parse standard/CONCAT_BLE notifications on one persistent task."""
+        await self._process_raw_queue(universal=False)
 
-            except Exception:
-                pass
-
-            if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
-                index = 0
-                last_cut = -1
-                data_size = len(self._concatDataBuffer)
-
-                while self._is_running:
-                    if index >= data_size:
-                        break
-
-                    if self._concatDataBuffer[index] == 0x55:
-                        if (index + 1) >= data_size:
-                            index = data_size
-                            continue
-                        n = self._concatDataBuffer[index + 1]
-                        if n < 2 or (index + 1 + n + 1) >= data_size:
-                            index += 1
-                            continue
-                        crc8 = self._concatDataBuffer[index + 1 + n + 1]
-                        calc_crc = calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
-                        if crc8 != calc_crc:
-                            index += 1
-                            continue
-                        if self._is_data_transfering:
-                            data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
-                            self._processDataPackage(data_package)
-                        last_cut = index = index + 2 + n
-                        index += 1
-                    else:
-                        index += 1
-
-                if last_cut > 0:
-                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
-                    last_cut = -1
-                    index = 0
-
-    def _processDataPackage(self, data: bytes) -> None:
+    def _processDataPackage(self, data: bytes, *, received_monotonic_ns: int | None = None) -> None:
         if not data:
             return
         v = data[0] & 0x7F
         self._last_progress_time = time.monotonic()
+        self._current_packet_received_monotonic_ns = (
+            received_monotonic_ns
+            if received_monotonic_ns is not None and received_monotonic_ns > 0
+            else time.monotonic_ns()
+        )
 
         def dispatch(sensor_type: SensorDataType, data_offset: int, data_gap: int) -> None:
             sensor_data = self.sensorDatas[sensor_type]
             if sensor_data.sampleRate <= 0:
                 return
+            sensor_data.receivedMonotonicNs = max(
+                sensor_data.receivedMonotonicNs,
+                self._current_packet_received_monotonic_ns,
+            )
             if self.checkReadSamples(data, sensor_data, data_offset, data_gap):
                 self.sendSensorData(sensor_data)
 
@@ -1270,6 +1751,10 @@ class DataContext:
             dispatch(SensorDataType.DATA_TYPE_EMG, sensor_data.packageIndexLength + 1, 0)
         elif v == DataType.NTF_GEST:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GEST]
+            sensor_data.receivedMonotonicNs = max(
+                sensor_data.receivedMonotonicNs,
+                self._current_packet_received_monotonic_ns,
+            )
             if self.checkReadSamples(data, sensor_data, 0, -1):
                 self.sendSensorData(sensor_data)
         elif v == DataType.NTF_EEG:
@@ -1280,15 +1765,27 @@ class DataContext:
             dispatch(SensorDataType.DATA_TYPE_BRTH, 3, 0)
         elif v == DataType.NTF_IMU and self.hasIMU():
             sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
+            sensor_data_acc.receivedMonotonicNs = max(
+                sensor_data_acc.receivedMonotonicNs,
+                self._current_packet_received_monotonic_ns,
+            )
             if self.checkReadSamples(data, sensor_data_acc, 3, 6):
                 self.sendSensorData(sensor_data_acc)
 
             sensor_data_gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
+            sensor_data_gyro.receivedMonotonicNs = max(
+                sensor_data_gyro.receivedMonotonicNs,
+                self._current_packet_received_monotonic_ns,
+            )
             if self.checkReadSamples(data, sensor_data_gyro, 9, 6):
                 self.sendSensorData(sensor_data_gyro)
 
             if self.isContainQAT6:
                 sensor_quat = self.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION]
+                sensor_quat.receivedMonotonicNs = max(
+                    sensor_quat.receivedMonotonicNs,
+                    self._current_packet_received_monotonic_ns,
+                )
                 if sensor_quat.sampleRate > 0 and self.checkReadSamples(data, sensor_quat, 15, 0):
                     self.sendSensorData(sensor_quat)
         elif v == DataType.NTF_PPG and self.hasPPG() and self._ntf_on(NtfParam.NTF_PPG):
@@ -1355,9 +1852,13 @@ class DataContext:
                     sensorData.lastPackageCounter = 0
 
                 if packageIndex < lastPackageIndex:
-                    rollover_delta = packageIndex + maxPackageIndex + 1 - lastPackageIndex
-                    if rollover_delta > _MAX_ALLOWED_PACKAGE_INDEX_DELTA:
+                    modulus = maxPackageIndex + 1
+                    rollover_distance = packageIndex + modulus - lastPackageIndex
+                    if rollover_distance >= modulus // 2:
                         # BLE notifications can arrive late after a newer packet.
+                        # A backward modular distance is stale; a small forward
+                        # distance is a real rollover even when packets zero through
+                        # two were among the missing packets.
                         self._logger.warning(
                             "Dropping stale packet index %s after %s for %s",
                             packageIndex,
@@ -1365,7 +1866,7 @@ class DataContext:
                             sensorData.dataType,
                         )
                         return False
-                    packageIndex = lastPackageIndex + rollover_delta
+                    packageIndex += modulus
                 elif packageIndex == lastPackageIndex:
                     return False
 
@@ -1383,7 +1884,10 @@ class DataContext:
                         self._watchdog_restart_pending = True
                         sensorData.clear()
                         if self._on_error is not None:
-                            self._on_error(f"Illegal package index jump ({lostPackageCounter}); resetting stream state")
+                            self._on_error(
+                                "SDK_SCIENTIFIC_DELIVERY_FAULT|stage=packet_counter|"
+                                f"illegal_jump={lostPackageCounter}; resetting stream state"
+                            )
                         return False
 
                     if newPackageIndex == 0:
@@ -1566,6 +2070,7 @@ class DataContext:
             sensorDataResult.lastPackageCounter = sensorData.lastPackageCounter
             sensorDataResult.lastPackageIndex = sensorData.lastPackageIndex
             sensorDataResult.lostPackageCount = sensorData.lostPackageCount
+            sensorDataResult.receivedMonotonicNs = sensorData.receivedMonotonicNs
             sensorDataResult.resolutionBits = sensorData.resolutionBits
             sensorDataResult.channelMask = sensorData.channelMask
             sensorDataResult.minPackageSampleCount = sensorData.minPackageSampleCount
@@ -1618,77 +2123,12 @@ class DataContext:
         sensorData.channelSamples = leftChannelSamples
 
         for sensorDataResult in sensorDataList:
-            self._publish_data(sensor_data_to_public(sensorDataResult))
+            public = sensor_data_to_public(sensorDataResult)
+            if self._deferred_publications is None:
+                self._publish_data(public)
+            else:
+                self._deferred_publications.append(public)
 
     async def process_universal_data(self) -> None:
-        """Parser loop for universal-stream (RFSTAR) devices.
-
-        Same role as :meth:`process_data` but always reassembles 0x55-framed
-        packets from ``_concatDataBuffer`` before calling
-        :meth:`_processDataPackage`.
-        """
-        while self._is_running:
-            while self._is_running and self._rawDataBuffer.empty():
-                await asyncio.sleep(0.01)
-            if not self._is_running:
-                break
-
-            try:
-                while self._is_running and not self._rawDataBuffer.empty():
-                    data = self._rawDataBuffer.get_nowait()
-                    self._concatDataBuffer.extend(data)
-            except Exception:
-                pass
-
-            index = 0
-            last_cut = -1
-            data_size = len(self._concatDataBuffer)
-
-            while self._is_running:
-                if index >= data_size:
-                    break
-
-                if self._concatDataBuffer[index] == 0x55:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    if self._is_data_transfering:
-                        data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
-                        self._processDataPackage(data_package)
-                    last_cut = index = index + 2 + n + 1
-                    index += 1
-                elif self._concatDataBuffer[index] == 0xAA:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
-
-                    if not _terminated:
-                        await self.gForce.async_on_cmd_response(data_package)
-                    last_cut = index = index + 2 + n + 1
-                    index += 1
-                else:
-                    index += 1
-
-            if last_cut > 0:
-                self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
-                last_cut = -1
-                index = 0
+        """Parse framed RFSTAR data and command responses on the same task."""
+        await self._process_raw_queue(universal=True)

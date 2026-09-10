@@ -35,6 +35,7 @@ class ManagedUsbRadioAdapter(ContinuousScanMixin, RadioAdapter):
         self._multi = multi
         self._firmware_resource_dir = firmware_resource_dir
         self._scanned: dict[str, RadioScanHit] = {}
+        self._transport_name: str | None = None
 
     @property
     def adapter_id(self) -> str:
@@ -44,6 +45,7 @@ class ManagedUsbRadioAdapter(ContinuousScanMixin, RadioAdapter):
         adapter = self._multi.resolve_adapter(self._adapter_id)
         self._adapter_id = adapter.id
         if adapter.usb_transport:
+            self._transport_name = adapter.usb_transport
             return adapter.usb_transport
         raise BluetoothAdapterNotFoundError(f"Adapter {self._adapter_id!r} has no Bumble transport string.")
 
@@ -52,18 +54,14 @@ class ManagedUsbRadioAdapter(ContinuousScanMixin, RadioAdapter):
             scan_managed_usb_devices,
         )
 
-        try:
-            transport = self._resolve_transport()
-        except BluetoothAdapterNotFoundError:
-            logger.warning("Managed USB scan skipped for %s: not in inventory", self._adapter_id)
-            return []
+        transport = self._resolve_transport()
 
         timeout_s = max(timeout_ms / 1000.0, 0.1)
         try:
             raw_hits = await scan_managed_usb_devices(transport_name=transport, timeout_s=timeout_s)
         except Exception:
             logger.warning("Managed USB scan failed for %s", self._adapter_id, exc_info=True)
-            return []
+            raise
 
         hits: list[RadioScanHit] = []
         for hit in raw_hits:
@@ -108,6 +106,10 @@ class ManagedUsbRadioAdapter(ContinuousScanMixin, RadioAdapter):
                 "Select a managed_usb adapter after claim_adapter() if needed."
             )
         require_claimable(adapter)
+        if not adapter.connectable:
+            raise ManagedUsbUnavailableError(
+                adapter.unavailable_reason or f"Adapter {self._adapter_id} is not connectable."
+            )
         if not adapter.usb_transport:
             raise BluetoothAdapterNotFoundError(f"Adapter {self._adapter_id} has no Bumble transport string.")
 
@@ -151,3 +153,13 @@ class ManagedUsbRadioAdapter(ContinuousScanMixin, RadioAdapter):
     async def close(self) -> None:
         self.stop_scan()
         self._scanned.clear()
+        transport = self._transport_name
+        if transport is None:
+            try:
+                transport = self._resolve_transport()
+            except BluetoothAdapterNotFoundError:
+                return
+        from synchroni_sensor_sdk.async_api.driver.managed_usb.backend import close_radio_session
+
+        await close_radio_session(transport)
+        self._transport_name = None

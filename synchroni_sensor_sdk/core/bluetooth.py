@@ -22,6 +22,8 @@ WINDOWS_CLAIM_ACTION_WINUSB = "windows_winusb_install"
 # Known EEG USB dongle VID:PID pairs that the SDK will help claim for WinUSB.
 KNOWN_EEG_USB_DONGLES: frozenset[tuple[str, str]] = frozenset(
     {
+        ("0a12", "0001"),  # Cambridge Silicon Radio CSR8510
+        ("10d7", "b012"),  # Actions "general adapter" dongles
         ("2357", "0604"),  # TP-Link UB500 Adapter
     }
 )
@@ -67,6 +69,13 @@ class BluetoothAdapter:
     is_in_use: bool = False
     firmware_status: str | None = None
     last_seen_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    # Recorder topology and availability metadata must not shift upstream arguments.
+    address: str | None = field(default=None, kw_only=True)
+    usb_bus: int | None = field(default=None, kw_only=True)
+    usb_port_path: str | None = field(default=None, kw_only=True)
+    connectable: bool = field(default=True, kw_only=True)
+    unavailable_reason: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)

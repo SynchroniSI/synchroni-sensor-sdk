@@ -1,10 +1,10 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 
 
 @dataclass(frozen=True)
 class SignalAcquisitionMode:
-    """One profile-declared sampling-rate and ADC-resolution pairing."""
+    """One manufacturer-published sampling-rate and ADC-resolution pairing."""
 
     sample_rate_hz: int
     adc_resolution_bits: int | None = None
@@ -12,7 +12,7 @@ class SignalAcquisitionMode:
 
 @dataclass(frozen=True)
 class ProductSpecification:
-    """Technical product capabilities, distinct from negotiated runtime values."""
+    """Manufacturer-published product facts, distinct from negotiated runtime values."""
 
     emg_channel_count: int | None = None
     adc_resolution_bits: int | None = None
@@ -23,6 +23,17 @@ class ProductSpecification:
     eeg_acquisition_modes: tuple[SignalAcquisitionMode, ...] = ()
     emg_acquisition_modes: tuple[SignalAcquisitionMode, ...] = ()
     breathing_acquisition_modes: tuple[SignalAcquisitionMode, ...] = ()
+
+    # Recorder metadata extends the upstream constructor without shifting its arguments.
+    manufacturer: str = field(default="", kw_only=True)
+    product_name: str = field(default="", kw_only=True)
+    model_aliases: tuple[str, ...] = field(default=(), kw_only=True)
+    nominal_emg_sample_rate_hz: int | None = field(default=None, kw_only=True)
+    bluetooth_version: str | None = field(default=None, kw_only=True)
+    nominal_battery_runtime_hours: float | None = field(default=None, kw_only=True)
+    source_urls: tuple[str, ...] = field(default=(), kw_only=True)
+    nominal_imu_sample_rate_hz: int | None = field(default=None, kw_only=True)
+    notes: tuple[str, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -46,28 +57,75 @@ class NativeDeviceProfile:
     product_specification: ProductSpecification | None = None
 
 
-_EEG_250_24 = (SignalAcquisitionMode(250, 24),)
-_EEG_250_500_24 = (*_EEG_250_24, SignalAcquisitionMode(500, 24))
-_EMG_500_12_1000_8 = (SignalAcquisitionMode(500, 12), SignalAcquisitionMode(1_000, 8))
-
-
 ORION_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="Synchroni / OYMotion",
+    product_name="Synchroni Orion EEG System",
+    model_aliases=(
+        "OB6000",
+        "OB6000A",
+        "OB6000B",
+        "OB6000C",
+        "Synchroni Orion",
+        "Synchroni Orion A",
+        "Synchroni Orion B",
+        "Synchroni Orion C",
+        "Orion-16",
+        "Orion-24",
+        "Orion-32",
+    ),
     adc_resolution_bits=24,
     imu_axis_count=6,
+    bluetooth_version="5.0",
+    nominal_battery_runtime_hours=10.0,
+    nominal_imu_sample_rate_hz=50,
+    source_urls=("https://synchroni.co/products/hardware/orion",),
+    notes=("OB6000A, OB6000B, and OB6000C are Recorder device-identity aliases.",),
 )
 
+ORION_A_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+    product_name="Orion-16",
+    model_aliases=("Orion-16", "OB6000A", "Orion A", "Synchroni Orion A"),
+    eeg_channel_count=16,
+    adc_resolution_bits=24,
+    imu_axis_count=6,
+    bluetooth_version="5.0",
+    nominal_battery_runtime_hours=10.0,
+    eeg_acquisition_modes=(SignalAcquisitionMode(250, 24), SignalAcquisitionMode(500, 24)),
+    nominal_imu_sample_rate_hz=50,
+    notes=("OB6000A and Orion A are Recorder device-name aliases for the 16-channel variant.",),
+    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
+)
 
-def _orion_variant(channels: int, *, supports_500_hz: bool) -> ProductSpecification:
-    return replace(
-        ORION_PRODUCT_SPECIFICATION,
-        eeg_channel_count=channels,
-        eeg_acquisition_modes=_EEG_250_500_24 if supports_500_hz else _EEG_250_24,
-    )
+ORION_B_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+    product_name="Orion-24",
+    model_aliases=("Orion-24", "OB6000B", "Orion B", "Synchroni Orion B"),
+    eeg_channel_count=24,
+    adc_resolution_bits=24,
+    imu_axis_count=6,
+    bluetooth_version="5.0",
+    nominal_battery_runtime_hours=10.0,
+    eeg_acquisition_modes=(SignalAcquisitionMode(250, 24), SignalAcquisitionMode(500, 24)),
+    nominal_imu_sample_rate_hz=50,
+    notes=("OB6000B and Orion B are Recorder device-name aliases for the 24-channel variant.",),
+    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
+)
 
-
-ORION_A_PRODUCT_SPECIFICATION = _orion_variant(16, supports_500_hz=True)
-ORION_B_PRODUCT_SPECIFICATION = _orion_variant(24, supports_500_hz=True)
-ORION_C_PRODUCT_SPECIFICATION = _orion_variant(32, supports_500_hz=False)
+ORION_C_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer=ORION_PRODUCT_SPECIFICATION.manufacturer,
+    product_name="Orion-32",
+    model_aliases=("Orion-32", "OB6000C", "Orion C", "Synchroni Orion C"),
+    eeg_channel_count=32,
+    adc_resolution_bits=24,
+    imu_axis_count=6,
+    bluetooth_version="5.0",
+    nominal_battery_runtime_hours=10.0,
+    eeg_acquisition_modes=(SignalAcquisitionMode(250, 24),),
+    nominal_imu_sample_rate_hz=50,
+    notes=("OB6000C and Orion C are Recorder device-name aliases for the 32-channel variant.",),
+    source_urls=ORION_PRODUCT_SPECIFICATION.source_urls,
+)
 
 _ORION_PRODUCT_SPECIFICATIONS_BY_VARIANT = {
     "a": ORION_A_PRODUCT_SPECIFICATION,
@@ -80,29 +138,79 @@ _ORION_PRODUCT_SPECIFICATIONS_BY_CHANNEL_COUNT = {
 }
 
 NURA_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="Synchroni / OYMotion",
+    product_name="Nura EEG & ECG System",
+    model_aliases=(
+        "OB5000",
+        "Synchroni Nura",
+        "Synchroni Uno",
+        "Synchroni Trio",
+        "Synchroni Pento",
+        "Synchroni Octo",
+        "Synchroni Neo",
+        "Synchroni Sync-Neo",
+    ),
     adc_resolution_bits=24,
     imu_axis_count=6,
-    eeg_acquisition_modes=_EEG_250_24,
+    bluetooth_version="4.2",
+    nominal_battery_runtime_hours=12.0,
+    eeg_acquisition_modes=(SignalAcquisitionMode(250, 24),),
+    nominal_imu_sample_rate_hz=50,
+    source_urls=("https://synchroni.co/products/hardware/nura",),
+    notes=("OB5000 and Sync-Neo identify the eight-channel Neo variant.",),
 )
 
 
-def _nura_variant(eeg_channels: int, ecg_channels: int) -> ProductSpecification:
-    return replace(
-        NURA_PRODUCT_SPECIFICATION,
+def _nura_variant(
+    name: str,
+    aliases: tuple[str, ...],
+    eeg_channels: int,
+    ecg_channels: int,
+    *,
+    notes: tuple[str, ...] = (),
+    source_urls: tuple[str, ...] = (),
+) -> ProductSpecification:
+    return ProductSpecification(
+        manufacturer=NURA_PRODUCT_SPECIFICATION.manufacturer,
+        product_name=name,
+        model_aliases=aliases,
         eeg_channel_count=eeg_channels,
         ecg_channel_count=ecg_channels,
+        adc_resolution_bits=24,
+        imu_axis_count=6,
+        bluetooth_version="4.2",
+        nominal_battery_runtime_hours=12.0,
+        eeg_acquisition_modes=(SignalAcquisitionMode(250, 24),),
+        nominal_imu_sample_rate_hz=50,
+        notes=notes,
+        source_urls=NURA_PRODUCT_SPECIFICATION.source_urls + source_urls,
     )
 
 
-NURA_UNO_PRODUCT_SPECIFICATION = _nura_variant(1, 0)
-NURA_TRIO_PRODUCT_SPECIFICATION = _nura_variant(2, 1)
-NURA_PENTO_PRODUCT_SPECIFICATION = _nura_variant(4, 1)
-NURA_OCTO_PRODUCT_SPECIFICATION = _nura_variant(7, 1)
-NURA_NEO_PRODUCT_SPECIFICATION = _nura_variant(8, 1)
+NURA_UNO_PRODUCT_SPECIFICATION = _nura_variant("Synchroni Uno", ("Synchroni Uno", "Uno"), 1, 0)
+NURA_TRIO_PRODUCT_SPECIFICATION = _nura_variant("Synchroni Trio", ("Synchroni Trio", "Trio"), 2, 1)
+NURA_PENTO_PRODUCT_SPECIFICATION = _nura_variant("Synchroni Pento", ("Synchroni Pento", "Pento"), 4, 1)
+NURA_OCTO_PRODUCT_SPECIFICATION = _nura_variant("Synchroni Octo", ("Synchroni Octo", "Octo"), 7, 1)
+NURA_NEO_PRODUCT_SPECIFICATION = _nura_variant(
+    "Synchroni Neo / Sync-Neo",
+    ("Synchroni Neo", "Synchroni Sync-Neo", "Sync-Neo", "Neo", "OB5000"),
+    8,
+    1,
+    notes=("Neo's ECG input is optional and replaces one EEG lead when enabled.",),
+    source_urls=(
+        "https://www.oymotion.com/product58/203",
+        "https://oymotion.com/product63",
+    ),
+)
 OB3000_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="OYMotion",
+    product_name="OB3000 EEG System",
+    model_aliases=("OB3000",),
     eeg_channel_count=23,
     ecg_channel_count=1,
     imu_axis_count=6,
+    source_urls=("https://oymotion.com/product58/202",),
+    notes=("OB3000 is not one of the 1/2/4/7/8-channel Synchroni Nura variants.",),
 )
 
 _NURA_PRODUCT_SPECIFICATIONS_BY_MARKER = (
@@ -117,26 +225,68 @@ _NURA_PRODUCT_SPECIFICATIONS_BY_MARKER = (
 )
 
 BREATHE_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="Synchroni",
+    product_name="Breathe Respiratory Sensor",
+    model_aliases=("Synchroni Breathe", "Breathe", "SyncBelt"),
     breathing_channel_count=1,
     adc_resolution_bits=24,
+    bluetooth_version="4.2",
+    nominal_battery_runtime_hours=6.0,
     breathing_acquisition_modes=(SignalAcquisitionMode(250, 24),),
+    source_urls=("https://synchroni.co/products/hardware/breathe",),
+    notes=("SyncBelt is a Recorder BLE-name alias.",),
 )
 
 GFORCE_PRO_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="Synchroni / OYMotion",
+    product_name="Synchroni Force / gForcePro+",
+    model_aliases=("gForcePro", "gForcePro+", "OYM-GF-P001", "Synchroni Force"),
     emg_channel_count=8,
+    nominal_emg_sample_rate_hz=1_000,
     imu_axis_count=9,
-    emg_acquisition_modes=_EMG_500_12_1000_8,
+    bluetooth_version="4.0 or 4.2 by model revision",
+    nominal_battery_runtime_hours=6.0,
+    emg_acquisition_modes=(SignalAcquisitionMode(500, 12), SignalAcquisitionMode(1_000, 8)),
+    nominal_imu_sample_rate_hz=50,
+    source_urls=(
+        "https://synchroni.co/products/hardware/force",
+        "https://www.oymotion.com/en/product32/149",
+    ),
+    notes=("OYM-GF-P001 is a Recorder model-identity alias.",),
 )
 
 OYWW1000_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="OYMotion",
+    product_name="gForce Ultra",
+    model_aliases=("OYWW1000", "gForce Ultra"),
     emg_channel_count=8,
+    nominal_emg_sample_rate_hz=1000,
     adc_resolution_bits=24,
     imu_axis_count=6,
+    bluetooth_version="4.2",
+    nominal_battery_runtime_hours=5.0,
     emg_acquisition_modes=(SignalAcquisitionMode(1_000, 24),),
+    source_urls=(
+        "https://www.oymotion.com/en/product32/215",
+        "https://oymotion.com/product17/206",
+        "https://www.oymotion.com/en/news37/489",
+    ),
+    notes=("OYMotion publishes 1000 Hz at 24-bit; 500 Hz is retained as an SDK/device-negotiated mode.",),
 )
 
 
-GFORCE_OCT_PRODUCT_SPECIFICATION = GFORCE_PRO_PRODUCT_SPECIFICATION
+GFORCE_OCT_PRODUCT_SPECIFICATION = ProductSpecification(
+    manufacturer="OYMotion",
+    product_name="gForceOct",
+    model_aliases=("gForceOct", "Synchroni Force Oct"),
+    emg_channel_count=8,
+    nominal_emg_sample_rate_hz=1_000,
+    imu_axis_count=9,
+    bluetooth_version="4.2",
+    emg_acquisition_modes=(SignalAcquisitionMode(500, 12), SignalAcquisitionMode(1_000, 8)),
+    source_urls=("https://www.oymotion.com/en/product32/148",),
+    notes=("Synchroni Force Oct is Recorder's name for the gForceOct family.",),
+)
 
 
 _ALL_FIRMWARE_FILTERS = frozenset(("50hz", "60hz", "hpf", "lpf"))
@@ -257,7 +407,7 @@ def published_product_specification(
     *identities: str,
     eeg_channel_count: int | None = None,
 ) -> ProductSpecification | None:
-    """Resolve technical variant capabilities without changing protocol behavior."""
+    """Resolve manufacturer facts without changing discovery or protocol behavior."""
     profile = native_device_profile(*identities)
     if profile is not None and profile.profile_id == "orion":
         channel_specification = _ORION_PRODUCT_SPECIFICATIONS_BY_CHANNEL_COUNT.get(eeg_channel_count)

@@ -518,7 +518,6 @@ class DataContext:
                 self._reject_standard_data_fragment(
                     f"expected_id={self._standard_data_fragment_expected_id}|received=unfragmented"
                 )
-                return None
             return packet
         if len(data) < 3:
             self._reject_standard_data_fragment(f"malformed_bytes={len(data)}")

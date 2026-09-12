@@ -263,6 +263,35 @@ async def test_breathe_missing_fragment_faults_without_publishing_corrupt_data()
     assert errors == ["SDK_SCIENTIFIC_DELIVERY_FAULT|stage=standard_data_fragment|expected_id=1|received_id=0"]
 
 
+async def test_interrupted_fragment_still_decodes_the_ordinary_imu_packet() -> None:
+    """Inspect parser output independently of the driver's intentional fault latch."""
+    _driver, _sensor, context, raw = _imu_context()
+    published: list[SensorData] = []
+    errors: list[str] = []
+    context._publish_data = published.append
+    context._on_error = errors.append
+    parser = asyncio.create_task(context.process_data())
+    raw.put_nowait(RawDataPacket(bytes.fromhex("ff011501004df45b4df4cd4df4904df4114df44d"), 1_000))
+    raw.put_nowait(RawDataPacket(bytes.fromhex("130000010002000300040005000600"), 2_000))
+    raw.put_nowait(RawDataPacket(bytes.fromhex("ff004df4bd4df4d24df50b4df5784df5bf"), 3_000))
+    try:
+        await asyncio.wait_for(raw.join(), 1)
+        await context._flush_reorder_fairly(force=True)
+        assert [packet.data_type for packet in published] == [DataType.NTF_ACC, DataType.NTF_GYRO]
+        assert [packet.received_monotonic_ns for packet in published] == [2_000, 2_000]
+        assert [[channel[0].raw_data for channel in packet.channel_samples] for packet in published] == [
+            [1, 2, 3],
+            [4, 5, 6],
+        ]
+        assert errors == [
+            "SDK_SCIENTIFIC_DELIVERY_FAULT|stage=standard_data_fragment|expected_id=0|received=unfragmented",
+            "SDK_SCIENTIFIC_DELIVERY_FAULT|stage=standard_data_fragment|orphan_tail_id=0",
+        ]
+    finally:
+        parser.cancel()
+        await asyncio.gather(parser, return_exceptions=True)
+
+
 async def test_breathe_fragment_state_clears_between_streams() -> None:
     context, _published, errors = _breathe_context()
     context.gForce.stop_streaming = AsyncMock()

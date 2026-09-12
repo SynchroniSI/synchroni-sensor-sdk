@@ -85,6 +85,7 @@ class ParseSensorData:
         self.lastPackageCounter: int = 0
         self.lastPackageIndex: int = 0
         self.lostPackageCount: int = 0
+        self.receivedMonotonicNs: int = 0
         self.resolutionBits: int = 0
         self.channelMask: int = 0
         self.minPackageSampleCount: int = 0
@@ -95,6 +96,7 @@ class ParseSensorData:
         self.lastPackageCounter = -1
         self.lastPackageIndex = 0
         self.lostPackageCount = 0
+        self.receivedMonotonicNs = 0
 
 
 # Legacy import names used by data_context.py (not the public v2 types).

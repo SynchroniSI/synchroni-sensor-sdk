@@ -71,6 +71,8 @@ class RadioRegistry:
     async def list_managed_for_scan(
         self,
         adapter_ids: Sequence[str] | None = None,
+        *,
+        refresh_inventory: bool = True,
     ) -> list[RadioAdapter]:
         """Select radios eligible for a scan pass (after inventory refresh).
 
@@ -81,7 +83,8 @@ class RadioRegistry:
         if self._multi is None:
             raise MultiAdapterDisabledError("Managed USB scan requires SensorHub(enable_multi_adapter=True).")
         multi = self._multi
-        await multi.refresh_adapters()
+        if refresh_inventory:
+            await multi.refresh_adapters()
 
         if adapter_ids is None:
             ids = multi.free_managed_adapter_ids()
@@ -107,6 +110,9 @@ class RadioRegistry:
                 if adapter.claim_required:
                     logger.info("Skipping claim_required adapter %s during managed scan", adapter.id)
                     continue
+                if not adapter.connectable:
+                    logger.info("Skipping unavailable adapter %s during managed scan", adapter.id)
+                    continue
                 if adapter.source != "managed_usb" or not adapter.usb_transport:
                     logger.warning(
                         "Adapter %s is not a managed USB radio; skipping",
@@ -122,6 +128,12 @@ class RadioRegistry:
         for aid in ids:
             radios.append(await self.get(aid))
         return radios
+
+    async def close(self, adapter_id: str) -> None:
+        """Close and forget one managed radio while keeping the hub alive."""
+        radio = self._managed.pop(adapter_id, None)
+        if radio is not None:
+            await radio.close()
 
     async def close_all(self) -> None:
         """Stop continuous scans and clear local caches on every known radio."""

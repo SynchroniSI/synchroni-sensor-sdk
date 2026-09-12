@@ -86,6 +86,9 @@ class SensorHub(SyncBridge):
     def list_bluetooth_adapters(self) -> list[BluetoothAdapter]:
         return self._run(self._async_hub.list_bluetooth_adapters())
 
+    def list_cached_bluetooth_adapters(self) -> list[BluetoothAdapter]:
+        return self._async_hub.list_cached_bluetooth_adapters()
+
     def claim_adapter(self, adapter_id: str) -> ClaimResult:
         return self._run(self._async_hub.claim_adapter(adapter_id))
 
@@ -95,11 +98,24 @@ class SensorHub(SyncBridge):
         *,
         adapter_id: str | None = None,
         adapter_ids: Sequence[str] | None = None,
+        refresh_inventory: bool = True,
     ) -> list[ScanResult]:
-        return self._run(self._async_hub.scan(timeout_ms, adapter_id=adapter_id, adapter_ids=adapter_ids))
+        return self._run(
+            self._async_hub.scan(
+                timeout_ms,
+                adapter_id=adapter_id,
+                adapter_ids=adapter_ids,
+                refresh_inventory=refresh_inventory,
+            )
+        )
 
-    def scan_managed_usb(self, timeout_ms: int = 2000) -> list[ScanResult]:
-        return self._run(self._async_hub.scan_managed_usb(timeout_ms))
+    def scan_managed_usb(self, timeout_ms: int = 2000, *, refresh_inventory: bool = True) -> list[ScanResult]:
+        return self._run(
+            self._async_hub.scan_managed_usb(
+                timeout_ms,
+                refresh_inventory=refresh_inventory,
+            )
+        )
 
     def start_scan(
         self,
@@ -164,6 +180,9 @@ class SensorHub(SyncBridge):
 
     def disconnect(self, address: str) -> None:
         self._sync_method(self._async_hub.disconnect, address)
+
+    def release_adapter(self, adapter_id: str) -> None:
+        self._sync_method(self._async_hub.release_adapter, adapter_id)
 
     def close(self) -> None:
         self._sync_method(self._async_hub.close)

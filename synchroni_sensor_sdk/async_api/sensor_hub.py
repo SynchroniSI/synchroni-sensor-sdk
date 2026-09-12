@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from synchroni_sensor_sdk.async_api.radio import RadioRegistry, RadioScanHit
+from synchroni_sensor_sdk.async_api.radio import RadioAdapter, RadioRegistry, RadioScanHit
 from synchroni_sensor_sdk.async_api.radio.filter import RFSTAR_SERVICE_GUID, SERVICE_GUID
 from synchroni_sensor_sdk.async_api.sensor import Sensor
 from synchroni_sensor_sdk.core.bluetooth import (
@@ -20,7 +21,12 @@ from synchroni_sensor_sdk.core.bluetooth import (
     SensorRoute,
 )
 from synchroni_sensor_sdk.core.driver import driver_factory
-from synchroni_sensor_sdk.core.exceptions import MultiAdapterDisabledError, SensorTerminatedError
+from synchroni_sensor_sdk.core.exceptions import (
+    BluetoothAdapterBusyError,
+    BluetoothAdapterNotFoundError,
+    MultiAdapterDisabledError,
+    SensorTerminatedError,
+)
 from synchroni_sensor_sdk.core.logging_config import configure_logging as _configure_logging
 
 if TYPE_CHECKING:
@@ -223,6 +229,11 @@ class SensorHub:
         multi = self._require_multi()
         return await multi.refresh_adapters()
 
+    def list_cached_bluetooth_adapters(self) -> list[BluetoothAdapter]:
+        """Return the last adapter inventory without touching USB or the OS."""
+        self._ensure_active()
+        return self._require_multi().list_cached_adapters()
+
     async def claim_adapter(self, adapter_id: str) -> ClaimResult:
         """Install/bind WinUSB for a claim_required Windows dongle (elevated).
 
@@ -237,6 +248,7 @@ class SensorHub:
         *,
         adapter_id: str | None = None,
         adapter_ids: Sequence[str] | None = None,
+        refresh_inventory: bool = True,
     ) -> list[ScanResult]:
         """Discover nearby sensors.
 
@@ -258,7 +270,11 @@ class SensorHub:
 
         if adapter_ids is not None:
             self._require_multi()
-            return await self._scan_radios(timeout_ms, adapter_ids=adapter_ids)
+            return await self._scan_radios(
+                timeout_ms,
+                adapter_ids=adapter_ids,
+                refresh_inventory=refresh_inventory,
+            )
 
         aid = adapter_id
         if aid is None or aid == SYSTEM_DEFAULT_ADAPTER_ID:
@@ -266,31 +282,84 @@ class SensorHub:
             return [self._to_scan_result(hit, adapter_id=SYSTEM_DEFAULT_ADAPTER_ID) for hit in hits]
 
         self._require_multi()
-        return await self._scan_radios(timeout_ms, adapter_ids=[aid])
+        return await self._scan_radios(
+            timeout_ms,
+            adapter_ids=[aid],
+            refresh_inventory=refresh_inventory,
+        )
 
-    async def scan_managed_usb(self, timeout_ms: int = 2000) -> list[ScanResult]:
+    async def scan_managed_usb(
+        self,
+        timeout_ms: int = 2000,
+        *,
+        refresh_inventory: bool = True,
+    ) -> list[ScanResult]:
         """Scan all free, ready managed USB dongles and return route-stamped results."""
         self._ensure_active()
-        multi = self._require_multi()
-        if not multi.list_cached_adapters():
-            await multi.refresh_adapters()
-        return await self._scan_radios(timeout_ms, adapter_ids=None)
+        self._require_multi()
+        return await self._scan_radios(
+            timeout_ms,
+            adapter_ids=None,
+            refresh_inventory=refresh_inventory,
+        )
 
     async def _scan_radios(
         self,
         timeout_ms: int,
         *,
         adapter_ids: Sequence[str] | None,
+        refresh_inventory: bool,
     ) -> list[ScanResult]:
-        radios = await self._radios.list_managed_for_scan(adapter_ids)
+        radios = await self._radios.list_managed_for_scan(
+            adapter_ids,
+            refresh_inventory=refresh_inventory,
+        )
         if not radios:
+            if adapter_ids:
+                requested = ", ".join(adapter_ids)
+                raise BluetoothAdapterNotFoundError(
+                    f"None of the selected Bluetooth adapters are available for scanning: {requested}"
+                )
             return []
-        batches = await asyncio.gather(*(radio.scan(timeout_ms) for radio in radios))
-        results: list[ScanResult] = []
-        for radio, hits in zip(radios, batches, strict=True):
+        batches = await asyncio.gather(
+            *(radio.scan(timeout_ms) for radio in radios),
+            return_exceptions=True,
+        )
+        failures: list[tuple[str, Exception]] = []
+        current_by_mac: dict[str, dict[str, tuple[RadioAdapter, RadioScanHit]]] = {}
+        for radio, batch in zip(radios, batches, strict=True):
+            if isinstance(batch, BaseException) and not isinstance(batch, Exception):
+                raise batch
+            if isinstance(batch, Exception):
+                failures.append((radio.adapter_id, batch))
+                self._logger.warning(
+                    "Bluetooth scan failed on adapter %s: %s",
+                    radio.adapter_id,
+                    batch,
+                )
+                continue
+            hits = batch
             for hit in hits:
-                routes = self._routes_for_mac(hit.mac_address)
-                results.append(self._to_scan_result(hit, adapter_id=radio.adapter_id, routes=routes or None))
+                current_by_mac.setdefault(hit.mac_address, {})[radio.adapter_id] = (radio, hit)
+
+        if failures and len(failures) == len(radios):
+            details = "; ".join(f"{adapter_id}: {error}" for adapter_id, error in failures)
+            raise RuntimeError(f"Bluetooth scan failed on every selected adapter: {details}") from failures[0][1]
+
+        results: list[ScanResult] = []
+        for mac, observations in current_by_mac.items():
+            best_radio, best_hit = max(observations.values(), key=lambda item: item[1].rssi)
+            routes = [
+                SensorRoute(adapter_id=adapter_id, mac_address=mac, rssi=hit.rssi)
+                for adapter_id, (_radio, hit) in observations.items()
+            ]
+            results.append(
+                self._to_scan_result(
+                    best_hit,
+                    adapter_id=best_radio.adapter_id,
+                    routes=routes,
+                )
+            )
         return results
 
     async def start_scan(
@@ -367,8 +436,13 @@ class SensorHub:
             hub session (cleared on hub close, not on disconnect).
         """
         self._ensure_active()
-        if address in self._connected_sensors:
-            return self._connected_sensors[address]
+        existing = self._connected_sensors.get(address)
+        if existing is not None:
+            if await existing.is_connected():
+                return existing
+            # An unexpected link loss can leave a stale hub entry. Destroy it
+            # before constructing a replacement driver for the reconnect.
+            await self.disconnect(address)
 
         use_managed = adapter_id is not None and adapter_id != SYSTEM_DEFAULT_ADAPTER_ID
         if use_managed:
@@ -382,12 +456,20 @@ class SensorHub:
             device=connection.device,
             advertisement_data=connection.advertisement_data,
         )
-        sensor = await Sensor.create(
-            connection.mac_address,
-            driver=driver,
-            adapter_id=SYSTEM_DEFAULT_ADAPTER_ID,
-        )
-        await sensor.connect()
+        sensor: Sensor | None = None
+        try:
+            sensor = await Sensor.create(
+                connection.mac_address,
+                driver=driver,
+                adapter_id=SYSTEM_DEFAULT_ADAPTER_ID,
+            )
+            await sensor.connect()
+        except BaseException:
+            if sensor is not None:
+                with contextlib.suppress(BaseException):
+                    await sensor.destroy()
+            raise
+        assert sensor is not None
         self._connected_sensors[address] = sensor
         self._sensor_adapters[address] = SYSTEM_DEFAULT_ADAPTER_ID
         return sensor
@@ -402,25 +484,36 @@ class SensorHub:
         is left in place.
         """
         multi = self._require_multi()
-        await multi.reserve(adapter_id, address)
+        radio = await self._radios.get(adapter_id)
+        canonical_adapter_id = radio.adapter_id
+        await multi.reserve(canonical_adapter_id, address)
+        sensor: Sensor | None = None
         try:
-            radio = await self._radios.get(adapter_id)
             connection = await radio.prepare_connection(address)
             if connection.managed_usb is None:
                 raise ValueError(f"No managed USB backend for sensor {address}")
+            if connection.managed_usb.adapter_id != canonical_adapter_id:
+                await multi.release_reserve(canonical_adapter_id)
+                canonical_adapter_id = connection.managed_usb.adapter_id
+                await multi.reserve(canonical_adapter_id, address)
             driver = driver_factory(
                 address,
                 device=connection.device,
                 advertisement_data=connection.advertisement_data,
                 managed_usb=connection.managed_usb,
             )
-            sensor = await Sensor.create(address, driver=driver, adapter_id=adapter_id)
+            sensor = await Sensor.create(address, driver=driver, adapter_id=canonical_adapter_id)
             await sensor.connect()
-            await multi.occupy(adapter_id, address)
-            self._sensor_adapters[address] = adapter_id
-        except Exception:
-            await multi.release_reserve(adapter_id)
+            await multi.occupy(canonical_adapter_id, address)
+            self._sensor_adapters[address] = canonical_adapter_id
+        except BaseException:
+            if sensor is not None:
+                with contextlib.suppress(BaseException):
+                    await sensor.destroy()
+            with contextlib.suppress(BaseException):
+                await multi.release_reserve(canonical_adapter_id)
             raise
+        assert sensor is not None
         self._connected_sensors[address] = sensor
         return sensor
 
@@ -477,6 +570,22 @@ class SensorHub:
         if self._multi is not None:
             await self._multi.release_occupancy(address)
         self._sensor_adapters.pop(address, None)
+
+    async def release_adapter(self, adapter_id: str) -> None:
+        """Release one unused managed adapter for reassignment in this hub."""
+        self._ensure_active()
+        multi = self._require_multi()
+        try:
+            canonical_adapter_id = multi.resolve_adapter(adapter_id).id
+        except BluetoothAdapterNotFoundError:
+            canonical_adapter_id = adapter_id
+        routed = [mac for mac, aid in self._sensor_adapters.items() if aid == canonical_adapter_id]
+        if routed:
+            raise BluetoothAdapterBusyError(
+                f"Adapter {canonical_adapter_id} still has connected sensor(s): {', '.join(routed)}"
+            )
+        await self._radios.close(canonical_adapter_id)
+        await multi.release_adapter(canonical_adapter_id)
 
     async def close(self) -> None:
         """Disconnect all sensors, stop scanning, revoke multi-adapter claims."""

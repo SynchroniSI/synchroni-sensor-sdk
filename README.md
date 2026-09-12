@@ -66,7 +66,9 @@ poetry run python examples/v2_cli.py clean -y
 ```
 
 Useful env vars: `SYNCHRONI_WINUSB_INSTALLER`, `SYNCHRONI_SDK_ASSETS_MANIFEST_URL`,
-`SYNCHRONI_RTK_FIRMWARE_AUTO=0` (disable Realtek host firmware auto-download).
+`SYNCHRONI_RTK_FIRMWARE_AUTO=1` (opt in to Realtek host firmware downloads;
+disabled by default). Otherwise provide local firmware through
+`BUMBLE_RTK_FIRMWARE_DIR`.
 
 ## Quick start (v2)
 
@@ -179,7 +181,7 @@ The sync API runs BLE I/O on a **background event loop** thread (`EventLoopRunne
 | Thread | Sync callbacks run on a **thread-pool worker** via `asyncio.to_thread` — not the main thread and not the BLE loop thread itself |
 | Main thread | **Not blocked** by callbacks while it is free (e.g. sleeping or in your own loop) |
 | Ordering | Dispatch for a given callback type is sequential: each invocation is awaited before the next |
-| Throughput | Slow handlers can cause the drop-oldest data buffer (default 64 packets) to discard data; that is buffer pressure, not main-thread blocking |
+| Throughput | A full data buffer (default 64 packets) rejects new data and reports a scientific delivery fault; already accepted packets drain before the final error callback. Start a new stream explicitly to recover. |
 
 **Do not call blocking hub/sensor methods from a sync callback** (`connect`, `disconnect`, `start_streaming`, `stop_streaming`, etc.). Those schedule work on the same background loop the dispatch task is waiting on and will **deadlock**.
 

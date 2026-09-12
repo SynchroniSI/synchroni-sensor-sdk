@@ -16,8 +16,11 @@ from synchroni_sensor_sdk.core.data import NtfDataType, Sample, SensorData
 def _sample_to_public(sample: ParseSample) -> Sample:
     return Sample(
         raw_data=sample.rawData,
-        data=int(sample.data) if isinstance(sample.data, float) else sample.data,
-        impedance=int(sample.impedance),
+        # Converted biosignal values and impedance are intentionally kept as
+        # floats.  Casting here silently quantizes scientific data before it
+        # reaches application callbacks.
+        data=float(sample.data),
+        impedance=float(sample.impedance),
         saturation=float(sample.saturation),
         sample_index=sample.sampleIndex,
         is_lost=sample.isLost,
@@ -42,4 +45,5 @@ def sensor_data_to_public(packet: ParseSensorData) -> SensorData:
         min_package_sample_count=packet.minPackageSampleCount,
         K=packet.K,
         lost_package_count=getattr(packet, "lostPackageCount", 0),
+        received_monotonic_ns=max(0, int(getattr(packet, "receivedMonotonicNs", 0))),
     )

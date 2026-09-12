@@ -7,7 +7,7 @@ import subprocess
 from collections import Counter
 from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
@@ -21,6 +21,8 @@ USB_BLUETOOTH_ADAPTER_NAME_RE = re.compile(
 USB_USERSPACE_DRIVER_RE = re.compile(r"\b(winusb|libusb|libusbk|libusb0)\b", re.IGNORECASE)
 KNOWN_USB_BLUETOOTH_VID_PID = frozenset(
     {
+        ("0a12", "0001"),  # Cambridge Silicon Radio CSR8510
+        ("10d7", "b012"),  # Actions "general adapter" dongles
         ("2357", "0604"),  # TP-Link UB500 Adapter
     }
 )
@@ -35,6 +37,11 @@ class LibusbUsbDevice:
     serial_number: str | None
     identity: str
     usb_transport: str
+
+    # Preserve upstream construction while retaining Recorder's measured topology.
+    usb_bus: int | None = field(default=None, kw_only=True)
+    usb_port_path: str | None = field(default=None, kw_only=True)
+    is_bluetooth_hci: bool = field(default=False, kw_only=True)
 
 
 async def run_command(args: list[str], timeout_s: float) -> str | None:
@@ -94,20 +101,7 @@ def list_libusb_managed_usb_adapters(now: datetime, *, platform_name: str) -> li
     devices = [
         device
         for device in list_libusb_usb_devices()
-        if looks_like_managed_usb_bluetooth_adapter(
-            " ".join(
-                value
-                for value in [
-                    device.name,
-                    device.manufacturer,
-                    device.vendor_id,
-                    device.product_id,
-                ]
-                if value is not None
-            ),
-            device.vendor_id,
-            device.product_id,
-        )
+        if device.is_bluetooth_hci or is_known_usb_bluetooth_adapter(device.vendor_id, device.product_id)
     ]
     serial_counts = Counter(
         (device.vendor_id, device.product_id, device.serial_number)
@@ -123,17 +117,8 @@ def list_libusb_managed_usb_adapters(now: datetime, *, platform_name: str) -> li
             serial_is_unique = serial_counts.get(serial_key, 0) == 1
         if serial_is_unique:
             identity = f"{device.vendor_id}:{device.product_id}:{normalize_identity_token(device.serial_number or '')}"
-            usb_transport = managed_usb_transport_name(
-                device.vendor_id,
-                device.product_id,
-                device.serial_number,
-            )
         else:
             identity = device.identity
-            usb_transport = device.usb_transport
-
-        if usb_transport is None:
-            continue
 
         adapters.append(
             BluetoothAdapter(
@@ -145,7 +130,10 @@ def list_libusb_managed_usb_adapters(now: datetime, *, platform_name: str) -> li
                 vendor_id=device.vendor_id,
                 product_id=device.product_id,
                 serial_number=device.serial_number,
-                usb_transport=usb_transport,
+                usb_bus=device.usb_bus,
+                usb_port_path=device.usb_port_path,
+                usb_transport=device.usb_transport,
+                connectable=True,
                 is_external=True,
                 last_seen_at=now,
             )
@@ -176,7 +164,8 @@ def list_libusb_usb_devices() -> list[LibusbUsbDevice]:
                 device_index = vid_pid_indexes.get(vid_pid_key, 0)
                 vid_pid_indexes[vid_pid_key] = device_index + 1
 
-                device_path = libusb_device_path(device)
+                usb_bus, usb_port_path = libusb_device_topology(device)
+                device_path = usb_device_path(usb_bus, usb_port_path)
                 usb_transport = managed_usb_transport_name(
                     vendor_id,
                     product_id,
@@ -195,6 +184,9 @@ def list_libusb_usb_devices() -> list[LibusbUsbDevice]:
                         vendor_id=vendor_id,
                         product_id=product_id,
                         serial_number=read_libusb_string(device, "getSerialNumber"),
+                        usb_bus=usb_bus,
+                        usb_port_path=usb_port_path,
+                        is_bluetooth_hci=libusb_device_is_bluetooth_hci(device),
                         identity=identity,
                         usb_transport=usb_transport,
                     )
@@ -221,17 +213,56 @@ def read_libusb_string(device: Any, method_name: str) -> str | None:
     return None
 
 
-def libusb_device_path(device: Any) -> str | None:
+def libusb_device_topology(device: Any) -> tuple[int | None, str | None]:
     try:
-        bus_number = device.getBusNumber()
+        bus_number = int(device.getBusNumber())
         port_numbers = list(device.getPortNumberList())
     except Exception:
-        return None
+        return None, None
 
     if not port_numbers:
-        return None
+        return bus_number, None
     port_path = ".".join(str(port_number) for port_number in port_numbers)
-    return f"{bus_number}-{port_path}"
+    return bus_number, port_path
+
+
+def usb_device_path(usb_bus: int | None, usb_port_path: str | None) -> str | None:
+    if usb_bus is None or usb_port_path is None or usb_port_path.strip() == "":
+        return None
+    return f"{usb_bus}-{usb_port_path.strip()}"
+
+
+def libusb_device_path(device: Any) -> str | None:
+    """Return the upstream path spelling using Recorder's shared topology parser."""
+    return usb_device_path(*libusb_device_topology(device))
+
+
+def libusb_device_is_bluetooth_hci(device: Any) -> bool:
+    """Detect standard USB Bluetooth HCI controllers without name heuristics."""
+    bluetooth_hci_class = (0xE0, 0x01, 0x01)
+    try:
+        if (
+            int(device.getDeviceClass()),
+            int(device.getDeviceSubClass()),
+            int(device.getDeviceProtocol()),
+        ) == bluetooth_hci_class:
+            return True
+    except Exception:
+        pass
+
+    try:
+        for configuration in device:
+            for interface in configuration:
+                for setting in interface:
+                    if (
+                        int(setting.getClass()),
+                        int(setting.getSubClass()),
+                        int(setting.getProtocol()),
+                    ) == bluetooth_hci_class:
+                        return True
+    except Exception:
+        return False
+    return False
 
 
 def usb_display_name(name: str | None, manufacturer: str | None) -> str:

@@ -9,8 +9,8 @@ class Sample:
     """
 
     raw_data: int
-    data: int
-    impedance: int
+    data: float
+    impedance: float
     saturation: float
     sample_index: int
     is_lost: bool
@@ -63,6 +63,9 @@ class SensorData:
     min_package_sample_count: int
     K: float
     lost_package_count: int = 0
+    received_monotonic_ns: int = 0
+    delivery_sequence: int | None = None
+    delivery_generation: int | None = None
 
     def clear(self) -> None:
         self.channel_samples.clear()
@@ -73,3 +76,6 @@ class SensorData:
         self.min_package_sample_count = 0
         self.K = 0.0
         self.lost_package_count = 0
+        self.received_monotonic_ns = 0
+        self.delivery_sequence = None
+        self.delivery_generation = None

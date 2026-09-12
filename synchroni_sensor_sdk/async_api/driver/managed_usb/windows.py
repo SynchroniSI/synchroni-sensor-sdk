@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -13,7 +12,6 @@ from synchroni_sensor_sdk.async_api.driver.managed_usb.usb_common import (
     is_known_usb_bluetooth_adapter,
     list_libusb_managed_usb_adapters,
     looks_like_managed_usb_bluetooth_adapter,
-    managed_usb_transport_name,
     run_command,
     run_command_json,
     usb_display_name,
@@ -54,6 +52,7 @@ class WindowsPnpCandidate:
     driver_name: str | None
     vendor_id: str | None
     product_id: str | None
+    removal_policy: int | None = None
 
 
 async def list_windows_managed_usb_adapters(command_timeout_s: float) -> list[BluetoothAdapter]:
@@ -90,7 +89,19 @@ async def list_windows_pnp_candidates(command_timeout_s: float) -> list[WindowsP
     ps_script = (
         "$devices = Get-PnpDevice -PresentOnly | "
         "Where-Object { $_.InstanceId -like 'USB\\VID_*' } | "
-        "Select-Object InstanceId,FriendlyName,Status,Class,Service,Manufacturer; "
+        "ForEach-Object { "
+        "$device = $_; "
+        "$removal = (Get-PnpDeviceProperty -InstanceId $device.InstanceId "
+        "-KeyName 'DEVPKEY_Device_RemovalPolicy' -ErrorAction SilentlyContinue).Data; "
+        "[PSCustomObject]@{"
+        "InstanceId=$device.InstanceId;"
+        "FriendlyName=$device.FriendlyName;"
+        "Status=$device.Status;"
+        "Class=$device.Class;"
+        "Service=$device.Service;"
+        "Manufacturer=$device.Manufacturer;"
+        "RemovalPolicy=$removal"
+        "} }; "
         "$devices | ConvertTo-Json -Compress"
     )
     raw = await run_command_json(
@@ -167,6 +178,10 @@ def merge_windows_pnp_row(
             value = first_string(row, [field])
             if value is not None:
                 existing[field] = value
+    if existing.get("RemovalPolicy") is None:
+        removal_policy = windows_removal_policy_from_row(row)
+        if removal_policy is not None:
+            existing["RemovalPolicy"] = removal_policy
 
 
 def windows_pnp_candidate_from_row(row: dict[str, object]) -> WindowsPnpCandidate | None:
@@ -190,29 +205,32 @@ def windows_pnp_candidate_from_row(row: dict[str, object]) -> WindowsPnpCandidat
         driver_name=first_string(row, ["DriverName"]),
         vendor_id=vendor_id,
         product_id=product_id,
+        removal_policy=windows_removal_policy_from_row(row),
     )
+
+
+def windows_removal_policy_from_row(row: dict[str, object]) -> int | None:
+    value = row.get("RemovalPolicy")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def windows_adapters_from_pnp_candidates(
     candidates: list[WindowsPnpCandidate],
     now: datetime,
 ) -> list[BluetoothAdapter]:
-    managed_candidates = [candidate for candidate in candidates if windows_row_looks_like_managed_usb(candidate)]
-    counts_by_vid_pid = Counter((candidate.vendor_id, candidate.product_id) for candidate in managed_candidates)
-    indexes_by_vid_pid: dict[tuple[str | None, str | None], int] = {}
     adapters: list[BluetoothAdapter] = []
 
     for candidate in candidates:
         if windows_row_looks_like_managed_usb(candidate):
-            vid_pid_key = (candidate.vendor_id, candidate.product_id)
-            device_index = indexes_by_vid_pid.get(vid_pid_key, 0)
-            indexes_by_vid_pid[vid_pid_key] = device_index + 1
-            usb_transport = managed_usb_transport_name(
-                candidate.vendor_id,
-                candidate.product_id,
-                None,
-                device_index=device_index if counts_by_vid_pid[vid_pid_key] > 1 else None,
-            )
             adapters.append(
                 BluetoothAdapter(
                     id=f"{MANAGED_USB_ADAPTER_ID_PREFIX}windows:{encode_windows_adapter_id_token(candidate.instance_id)}",
@@ -228,13 +246,18 @@ def windows_adapters_from_pnp_candidates(
                     vendor_id=candidate.vendor_id,
                     product_id=candidate.product_id,
                     device_instance_id=candidate.instance_id,
-                    usb_transport=usb_transport,
+                    usb_transport=None,
                     driver_name=candidate.driver_name or candidate.service or None,
+                    connectable=False,
+                    unavailable_reason=(
+                        "Windows reports a userspace Bluetooth dongle, but libusb could not "
+                        "verify an HCI interface and physical USB route."
+                    ),
                     is_external=True,
                     last_seen_at=now,
                 )
             )
-        elif is_known_usb_bluetooth_adapter(candidate.vendor_id, candidate.product_id):
+        elif windows_row_looks_like_os_bluetooth(candidate):
             claim_required = windows_row_requires_claim(candidate)
             adapters.append(
                 BluetoothAdapter(
@@ -248,7 +271,14 @@ def windows_adapters_from_pnp_candidates(
                     device_instance_id=candidate.instance_id,
                     usb_transport=None,
                     driver_name=candidate.driver_name or candidate.service or None,
-                    is_external=True,
+                    is_external=windows_row_is_removable(candidate),
+                    connectable=False,
+                    unavailable_reason=(
+                        windows_claim_message(candidate)
+                        if claim_required
+                        else "Windows manages this Bluetooth controller, and it is not an "
+                        "approved removable dedicated-dongle model."
+                    ),
                     claim_required=claim_required,
                     claim_action=WINDOWS_CLAIM_ACTION_WINUSB if claim_required else None,
                     claim_message=windows_claim_message(candidate) if claim_required else None,
@@ -356,9 +386,24 @@ def windows_row_looks_like_synchroni_winusb(candidate: WindowsPnpCandidate, sear
 
 
 def windows_row_requires_claim(candidate: WindowsPnpCandidate) -> bool:
-    if not is_known_usb_bluetooth_adapter(candidate.vendor_id, candidate.product_id):
-        return False
-    return not windows_row_looks_like_managed_usb(candidate)
+    return (
+        windows_row_looks_like_os_bluetooth(candidate)
+        and windows_row_is_removable(candidate)
+        and is_known_usb_bluetooth_adapter(candidate.vendor_id, candidate.product_id)
+        and not windows_row_looks_like_managed_usb(candidate)
+    )
+
+
+def windows_row_looks_like_os_bluetooth(candidate: WindowsPnpCandidate) -> bool:
+    return (
+        candidate.device_class.strip().lower() == "bluetooth"
+        or candidate.service.strip().lower() in WINDOWS_OS_BLUETOOTH_SERVICES
+    )
+
+
+def windows_row_is_removable(candidate: WindowsPnpCandidate) -> bool:
+    # CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL / EXPECT_SURPRISE_REMOVAL.
+    return candidate.removal_policy in {2, 3}
 
 
 def windows_claim_message(candidate: WindowsPnpCandidate) -> str:

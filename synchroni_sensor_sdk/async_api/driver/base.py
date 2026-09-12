@@ -16,7 +16,7 @@ class Driver(ABC):
 
     All methods are async and must be awaited from the caller's event loop.
 
-    Sensor data uses a bounded :class:`DropOldestBuffer`; power, state, and error
+    Sensor data uses a bounded buffer that faults on overflow; power, state, and error
     events use unbounded asyncio queues.
 
     **Publishing sensor data**
@@ -40,7 +40,11 @@ class Driver(ABC):
         self._logger = logging.getLogger(__name__)
         self._address = address
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._data_buffer: DropOldestBuffer[SensorData] = DropOldestBuffer(data_buffer_maxsize)
+        self._data_buffer: DropOldestBuffer[SensorData] = DropOldestBuffer(data_buffer_maxsize, reject_on_full=True)
+        self._scientific_delivery_fault: str | None = None
+        self._accepted_data_sequence = 0
+        self._delivery_generation = 0
+        self._scientific_fault_boundary: tuple[int, int] | None = None
         self._power_queue: asyncio.Queue[int] = asyncio.Queue()
         self._state_queue: asyncio.Queue[DeviceState] = asyncio.Queue()
         self._error_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -66,13 +70,62 @@ class Driver(ABC):
 
     async def publish_data(self, data: SensorData) -> None:
         """
-        Enqueue sensor data, dropping the oldest packet when the buffer is full.
+        Enqueue sensor data, reporting a scientific-delivery fault if full.
 
         Use when the caller is already on the driver's event loop. For BLE
         notification handlers that may run on a platform thread, use
         :meth:`schedule_publish_data` instead.
         """
-        await self._data_buffer.publish(data)
+        self.publish_data_on_loop(data)
+
+    def report_scientific_delivery_fault(self, reason: str) -> None:
+        """Latch one fault on the driver loop; recovery requires an explicit new stream."""
+        if self._scientific_delivery_fault is not None:
+            return
+        self._scientific_delivery_fault = reason
+        self._scientific_fault_boundary = (self._delivery_generation, self._accepted_data_sequence)
+        self._publish_error_on_loop(
+            f"SDK_SCIENTIFIC_DELIVERY_FAULT|delivery_generation={self._delivery_generation}"
+            f"|accepted_sequence={self._accepted_data_sequence}|{reason}"
+        )
+
+    @property
+    def scientific_fault_boundary(self) -> tuple[int, int] | None:
+        """Generation and last public packet accepted by this driver's bounded buffer."""
+        return self._scientific_fault_boundary
+
+    def reset_scientific_delivery(self) -> None:
+        """Reset only when starting a new stream, never from the parser watchdog."""
+        if self._data_buffer.qsize:
+            raise RuntimeError("Previous sensor stream still has undelivered data")
+        self._data_buffer.clear_on_loop()
+        self._scientific_delivery_fault = None
+        self._scientific_fault_boundary = None
+        self._delivery_generation += 1
+
+    @property
+    def pending_data_packets(self) -> int:
+        return self._data_buffer.qsize
+
+    def publish_data_on_loop(self, data: SensorData) -> None:
+        """Nonblocking parser handoff without a deferred callback for each packet."""
+        if self._scientific_delivery_fault is not None:
+            return
+        if self._data_buffer.closed:
+            self.report_scientific_delivery_fault("stage=parsed_buffer_closed")
+            return
+        try:
+            self._data_buffer.publish_on_loop(data)
+            self._accepted_data_sequence += 1
+            # publish_on_loop cannot yield; fill the accepted packet's boundary
+            # before its consumer can run. Rejected packets receive no sequence.
+            data.delivery_sequence = self._accepted_data_sequence
+            data.delivery_generation = self._delivery_generation
+        except BufferError:
+            self.report_scientific_delivery_fault(
+                f"stage=parsed_buffer|capacity={self._data_buffer.maxsize}"
+                f"|packet_counter={data.last_package_counter}|received_monotonic_ns={data.received_monotonic_ns}"
+            )
 
     def schedule_publish_data(self, data: SensorData) -> None:
         """
@@ -92,7 +145,7 @@ class Driver(ABC):
         """
         if self._loop is None:
             raise RuntimeError("Driver event loop is not bound; call connect() first")
-        self._loop.call_soon_threadsafe(self._data_buffer.publish_on_loop, data)
+        self._loop.call_soon_threadsafe(self.publish_data_on_loop, data)
 
     def _publish_power_on_loop(self, level: int) -> None:
         self._power_queue.put_nowait(level)

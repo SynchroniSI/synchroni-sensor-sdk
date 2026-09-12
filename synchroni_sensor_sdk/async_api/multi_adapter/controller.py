@@ -94,6 +94,8 @@ class MultiAdapterController:
                 continue
             if adapter.claim_required:
                 continue
+            if not adapter.connectable:
+                continue
             if adapter.id in self._occupied or adapter.id in self._reserved:
                 continue
             if not adapter.usb_transport:
@@ -166,6 +168,19 @@ class MultiAdapterController:
             for aid, mac in list(self._reserved.items()):
                 if mac == sensor_mac:
                     self._reserved.pop(aid, None)
+
+    async def release_adapter(self, adapter_id: str) -> None:
+        """Release one adapter's hub-session claim and temporary reservation.
+
+        The caller must first disconnect any sensor routed through the adapter.
+        This makes a long-lived hub reusable without tearing down unrelated
+        radios or clearing the complete inventory.
+        """
+        if self.is_system_adapter(adapter_id):
+            return
+        async with self._lock:
+            self._occupied.pop(adapter_id, None)
+            self._reserved.pop(adapter_id, None)
 
     def resolve_adapter(self, adapter_id: str) -> BluetoothAdapter:
         """Return an inventory row, matching by id or VID/PID(+serial) alias."""

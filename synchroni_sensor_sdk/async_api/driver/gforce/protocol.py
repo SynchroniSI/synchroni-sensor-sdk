@@ -18,6 +18,7 @@ from bleak import (
 )
 
 from synchroni_sensor_sdk.async_api.driver.gforce.crc_utils import BLE_TIMEOUT
+from synchroni_sensor_sdk.async_api.driver.ingress import MAX_NOTIFICATION_BYTES, BoundedThreadIngress
 
 # Minimum gap between any successive protocol commands (WRITE + optional notify).
 COMMAND_MIN_INTERVAL_S = 0.075
@@ -89,6 +90,14 @@ class Characteristic:
     uuid: str
     service_uuid: str
     descriptor_uuids: list[str]
+
+
+@dataclass(frozen=True)
+class RawDataPacket:
+    """One BLE notification with its earliest Recorder-visible host timestamp."""
+
+    data: bytes
+    received_monotonic_ns: int
 
 
 class Command(IntEnum):
@@ -278,19 +287,31 @@ class SampleResolution(IntEnum):
 
 
 class SamplingRate(IntEnum):
+    HZ_50 = (50,)
+    HZ_100 = (100,)
+    HZ_200 = (200,)
     HZ_250 = (250,)
+    HZ_400 = (400,)
     HZ_500 = (500,)
     HZ_650 = (650,)
     HZ_1000 = (1000,)
+    HZ_2000 = (2000,)
 
 
 # PyPI sensor-sdk 0.9.6 decodes the EEG/ECG capability mask in this order.
 EEG_CAP_FS_BITMASK_RATES = (250, 500, 1000, 2000)
+# EMG capability bits follow the legacy gForce rate order instead.
+EMG_CAP_FS_BITMASK_RATES = (250, 500, 650, 1000)
 
 
 def decode_cap_fs_bitmask(mask: int) -> tuple[int, ...]:
     """Decode the EEG/ECG rate mask used by the released Python SDK."""
     return tuple(rate for bit, rate in enumerate(EEG_CAP_FS_BITMASK_RATES) if mask & (1 << bit))
+
+
+def decode_emg_cap_fs_bitmask(mask: int) -> tuple[int, ...]:
+    """Decode the distinct legacy gForce EMG rate mask."""
+    return tuple(rate for bit, rate in enumerate(EMG_CAP_FS_BITMASK_RATES) if mask & (1 << bit))
 
 
 @dataclass
@@ -320,6 +341,21 @@ class EmgRawDataConfig:
             batch_len,
             SampleResolution(resolution),
         )
+
+
+@dataclass
+class EmgRawDataCap:
+    fs: int = 0
+    channel_mask: int = 0
+    batch_len: int = 0
+    resolution: int = 0
+
+    def to_bytes(self) -> bytes:
+        return struct.pack("<HHBB", self.fs, self.channel_mask, self.batch_len, self.resolution)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Self:
+        return cls(*struct.unpack("<HHBB", data))
 
 
 @dataclass
@@ -538,6 +574,7 @@ class GForceProtocol:
         *,
         managed_usb_transport: str | None = None,
         managed_usb_peer_address: str | None = None,
+        on_ingress_fault: Callable[[str], None] | None = None,
     ) -> None:
         """Build a GForce ATT protocol over OS Bleak or managed USB HCI.
 
@@ -551,12 +588,17 @@ class GForceProtocol:
         self.cmd_char: str = cmd_char
         self.data_char: str = data_char
         # Opcode → payload queue. ``None`` is a cancel/sentinel (clear pending).
-        self.responses: dict[Command, asyncio.Queue[CommandReply] | None] = {}
+        self.responses: dict[
+            Command,
+            asyncio.Queue[CommandReply] | None,
+        ] = {}
         self.resolution: SampleResolution = SampleResolution.BITS_8
         self._num_channels: int = 8
         self._device: BLEDevice = device
         self._is_universal_stream: bool = is_universal_stream
-        self._raw_data_buf: asyncio.Queue[bytes] | None = None
+        self._raw_data_buf: asyncio.Queue[RawDataPacket] | None = None
+        self._raw_ingress: BoundedThreadIngress[RawDataPacket] | None = None
+        self._on_ingress_fault = on_ingress_fault or self._log_ingress_fault
         self.packet_id: int = 0
         self.data_packet: list = []
         self._partial_cmd_expected_id: int | None = None
@@ -577,15 +619,39 @@ class GForceProtocol:
             raise RuntimeError("BLE client is not connected")
         return self.client
 
-    def _require_raw_data_buf(self) -> asyncio.Queue[bytes]:
+    def _require_raw_data_buf(self) -> asyncio.Queue[RawDataPacket]:
         if self._raw_data_buf is None:
             raise RuntimeError("Raw data buffer is not configured")
         return self._raw_data_buf
 
+    def _log_ingress_fault(self, reason: str) -> None:
+        self._logger.error("SDK_SCIENTIFIC_DELIVERY_FAULT|%s", reason)
+
+    def reset_raw_ingress(self) -> None:
+        if self._raw_ingress is not None:
+            self._raw_ingress.reset()
+
+    async def drain_raw_ingress(self) -> None:
+        # Called only after stop_notify/subscription-off acknowledgement. Yield
+        # once to include callback work already scheduled on the event loop.
+        await asyncio.sleep(0)
+        while self._raw_ingress is not None and self._raw_ingress.pending_count:
+            await asyncio.sleep(0)
+
+    def _queue_raw_bytes(self, target: asyncio.Queue[RawDataPacket], data: bytearray) -> None:
+        # Production installs this before start_notify. Lazy setup supports
+        # callers that inject their raw queue without opening a BLE connection.
+        if self._raw_ingress is None:
+            self._raw_ingress = BoundedThreadIngress(self._loop, target, self._on_ingress_fault)
+        if len(data) > MAX_NOTIFICATION_BYTES:
+            self._raw_ingress.reject(f"stage=raw_notification_size|bytes={len(data)}|limit={MAX_NOTIFICATION_BYTES}")
+            return
+        self._raw_ingress.publish(RawDataPacket(data=bytes(data), received_monotonic_ns=time.monotonic_ns()))
+
     async def connect(
         self,
         disconnect_cb: Callable[..., None],
-        buf: asyncio.Queue[bytes],
+        buf: asyncio.Queue[RawDataPacket],
     ) -> None:
         # Fresh session: never inherit opcode maps or cool-downs from a prior connection.
         self.clear_pending_responses()
@@ -596,6 +662,7 @@ class GForceProtocol:
 
         self.device_name = self._device.name or ""
         self._raw_data_buf = buf
+        self._raw_ingress = BoundedThreadIngress(self._loop, buf, self._on_ingress_fault)
 
         if self._managed_usb_transport and self._managed_usb_peer_address:
             await self._connect_managed_usb(disconnect_cb)
@@ -684,7 +751,7 @@ class GForceProtocol:
                 await client.disconnect()
             raise
 
-    def _on_data_response(self, q: asyncio.Queue[bytes], bs: bytearray) -> None:
+    def _on_data_response(self, q: asyncio.Queue[RawDataPacket], bs: bytearray) -> None:
         # bs = bytes(bs)
 
         # full_packet = []
@@ -713,7 +780,7 @@ class GForceProtocol:
         if len(full_packet) == 0:
             return
 
-        self._loop.call_soon_threadsafe(q.put_nowait, bytes(full_packet))
+        self._queue_raw_bytes(q, full_packet)
 
     @staticmethod
     def _convert_acceleration_to_g(data: bytes) -> npt.NDArray[np.floating[Any]]:
@@ -772,7 +839,7 @@ class GForceProtocol:
 
     def _on_universal_response(self, _: BleakGATTCharacteristic, bs: bytearray) -> None:
         buf = self._require_raw_data_buf()
-        self._loop.call_soon_threadsafe(buf.put_nowait, bytes(bs))
+        self._queue_raw_bytes(buf, bs)
 
     def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray) -> None:
         self._loop.call_soon_threadsafe(self._schedule_cmd_response, bytes(bs))
@@ -785,7 +852,11 @@ class GForceProtocol:
             response = self._parse_response(assembled)
             queue = self.responses.get(response.cmd)
             if queue is not None:
-                if response.code != ResponseCode.SUCCESS:
+                if response.cmd == Command.CMD_GET_FRIMWARE_FILTER_SWITCH and response.code == ResponseCode.NOT_SUPPORT:
+                    # Some Force firmware accepts filter writes but explicitly
+                    # reports that filter readback is unavailable.
+                    queue.put_nowait(b"")
+                elif response.code != ResponseCode.SUCCESS:
                     queue.put_nowait(CommandResponseError(response.cmd, response.code))
                 else:
                     queue.put_nowait(response.data)
@@ -1094,14 +1165,9 @@ class GForceProtocol:
         set command is accepted.  Treat that response as unavailable instead
         of indexing an empty buffer.
         """
-        try:
-            buf = _response_bytes(
-                await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
-            )
-        except CommandResponseError as error:
-            if error.code == ResponseCode.NOT_SUPPORT:
-                return None
-            raise
+        buf = _response_bytes(
+            await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
+        )
         if not buf:
             return None
         return buf[0]
@@ -1140,6 +1206,17 @@ class GForceProtocol:
             )
         )
         return EmgRawDataConfig.from_bytes(buf)
+
+    async def get_emg_raw_data_cap(self) -> EmgRawDataCap:
+        buf = _response_bytes(
+            await self._send_request(
+                Request(
+                    cmd=Command.GET_EMG_RAWDATA_CAP,
+                    has_res=True,
+                )
+            )
+        )
+        return EmgRawDataCap.from_bytes(buf)
 
     async def get_eeg_raw_data_config(self) -> EegRawDataConfig:
         buf = _response_bytes(
@@ -1282,7 +1359,7 @@ class GForceProtocol:
             )
         )
 
-    async def start_streaming(self, q: asyncio.Queue[bytes]) -> None:
+    async def start_streaming(self, q: asyncio.Queue[RawDataPacket]) -> None:
         client = self._require_client()
         await asyncio.wait_for(
             client.start_notify(
@@ -1297,6 +1374,7 @@ class GForceProtocol:
             await asyncio.wait_for(self._require_client().stop_notify(self.data_char), timeout=BLE_TIMEOUT)
         except Exception as e:
             self._logger.warning("Failed to stop streaming: %s", e)
+            raise
 
     async def disconnect(self) -> None:
         # Drop any pending opcode waiters before tearing down the link so a later

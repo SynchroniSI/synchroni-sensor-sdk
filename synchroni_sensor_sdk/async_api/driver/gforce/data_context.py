@@ -25,6 +25,7 @@ from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
     decode_cap_fs_bitmask,
     decode_emg_cap_fs_bitmask,
 )
+from synchroni_sensor_sdk.async_api.driver.ingress import MAX_NOTIFICATION_BYTES
 from synchroni_sensor_sdk.core.data import SensorData as PublicSensorData
 from synchroni_sensor_sdk.core.device import DeviceParams, native_device_profile
 from synchroni_sensor_sdk.core.exceptions import (
@@ -216,6 +217,11 @@ class DataContext:
         self._reorder_flush_lock = asyncio.Lock()
         self._on_error = on_error
         self._concatDataBuffer: bytearray = bytearray()
+        # Standard-data fragments are reassembled only on this parser loop.
+        # This keeps notification callbacks as bounded, thread-safe ingress and
+        # leaves CONCAT_BLE/universal wire framing on their existing path.
+        self._standard_data_fragment_expected_id: int | None = None
+        self._standard_data_fragment = bytearray()
         self._packet_reorder_states: dict[int, _PacketReorderState] = {}
         self._current_packet_received_monotonic_ns: int = 0
         self._reordered_packet_count: int = 0
@@ -488,6 +494,59 @@ class DataContext:
         else:
             self._parsed_packet_count += 1
 
+    def _reset_standard_data_fragment(self) -> None:
+        self._standard_data_fragment_expected_id = None
+        self._standard_data_fragment.clear()
+
+    def _reject_standard_data_fragment(self, detail: str) -> None:
+        self._reset_standard_data_fragment()
+        if self._on_error is not None:
+            self._on_error(f"SDK_SCIENTIFIC_DELIVERY_FAULT|stage=standard_data_fragment|{detail}")
+
+    def _reassemble_standard_data_fragment(self, packet: RawDataPacket) -> RawDataPacket | None:
+        """Return one complete low-MTU standard-data packet, if available.
+
+        Breathe firmware sends ``ff,N,payload`` fragments in strictly descending
+        order through ``ff,0,payload``.  The final fragment's ingress time is
+        retained because it is the instant the complete logical packet exists.
+        """
+        data = packet.data
+        if not data:
+            return None
+        if data[0] != ResponseCode.PARTIAL_PACKET:
+            if self._standard_data_fragment_expected_id is not None:
+                self._reject_standard_data_fragment(
+                    f"expected_id={self._standard_data_fragment_expected_id}|received=unfragmented"
+                )
+            return packet
+        if len(data) < 3:
+            self._reject_standard_data_fragment(f"malformed_bytes={len(data)}")
+            return None
+
+        fragment_id = int(data[1])
+        expected = self._standard_data_fragment_expected_id
+        if expected is None:
+            if fragment_id == 0:
+                self._reject_standard_data_fragment("orphan_tail_id=0")
+                return None
+        elif fragment_id != expected:
+            self._reject_standard_data_fragment(f"expected_id={expected}|received_id={fragment_id}")
+            return None
+
+        self._standard_data_fragment.extend(data[2:])
+        if len(self._standard_data_fragment) > MAX_NOTIFICATION_BYTES:
+            self._reject_standard_data_fragment(
+                f"bytes={len(self._standard_data_fragment)}|limit={MAX_NOTIFICATION_BYTES}"
+            )
+            return None
+        if fragment_id != 0:
+            self._standard_data_fragment_expected_id = fragment_id - 1
+            return None
+
+        complete = RawDataPacket(bytes(self._standard_data_fragment), packet.received_monotonic_ns)
+        self._reset_standard_data_fragment()
+        return complete
+
     async def _process_packets_fairly(self, packets: list[RawDataPacket]) -> None:
         """Yield for every public output, including multi-output reorder bursts."""
         for packet in packets:
@@ -568,6 +627,7 @@ class DataContext:
         if self._is_data_transfering:
             self._maybe_log_ingress_diagnostics(force=True)
         self._is_data_transfering = False
+        self._reset_standard_data_fragment()
 
     def close(self) -> None:
         """Signal parser loops to exit (``_is_running = False``).
@@ -588,6 +648,7 @@ class DataContext:
         self.impedanceData.clear()
         self.saturationData.clear()
         self._concatDataBuffer.clear()
+        self._reset_standard_data_fragment()
         self._packet_reorder_states.clear()
         self._current_packet_received_monotonic_ns = 0
         self._reordered_packet_count = 0
@@ -743,6 +804,14 @@ class DataContext:
 
     async def apply_subscription(self) -> None:
         """Push current NTF map to the device (after init)."""
+        if self.hasIMU() and self._ntf_on(NtfParam.NTF_IMU):
+            acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
+            gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
+            if acc.sampleRate <= 0 or gyro.sampleRate <= 0:
+                # Non-RFSTAR devices begin with IMU disabled.  Recorder can
+                # enable it after ``init()``, so build the descriptors before
+                # the device is allowed to notify IMU packets.
+                await self.initIMU(1)
         self.build_notify_data_flag()
         await self.apply_function_switch()
         if not self.isUniversalStream:
@@ -1388,6 +1457,10 @@ class DataContext:
                 if drain_ingress is not None:
                     await drain_ingress()
                 await self._rawDataBuffer.join()
+                if self._standard_data_fragment_expected_id is not None:
+                    self._reject_standard_data_fragment(
+                        f"incomplete_on_stop|expected_id={self._standard_data_fragment_expected_id}"
+                    )
                 await self._flush_reorder_fairly(force=True)
                 for sensor_data in self.sensorDatas:
                     if sensor_data.channelSamples and sensor_data.channelSamples[0]:
@@ -1588,6 +1661,7 @@ class DataContext:
             if self._watchdog_restart_pending:
                 self._watchdog_restart_pending = False
                 self._concatDataBuffer.clear()
+                self._reset_standard_data_fragment()
                 self._packet_reorder_states.clear()
                 self._drain_queue(self._rawDataBuffer)
                 for sensor_data in self.sensorDatas:
@@ -1605,7 +1679,9 @@ class DataContext:
                 if universal or self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE:
                     await self._process_framed_packet(packet, universal=universal)
                 else:
-                    await self._process_ingress_fairly(packet)
+                    complete = self._reassemble_standard_data_fragment(packet)
+                    if complete is not None:
+                        await self._process_ingress_fairly(complete)
             except Exception as error:
                 self._record_parse_error(error, packet)
             finally:

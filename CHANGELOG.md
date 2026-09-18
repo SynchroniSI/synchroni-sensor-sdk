@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.2.1](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.2.0...v2.2.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* keep ordinary packets in the standard-data parser ([f95cd5e](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/f95cd5e7b42a24aafbd3fd306ce1b9801fa0000c))
+* port Recorder acquisition integrity and managed USB improvements ([0ab3740](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/0ab3740ff46b6d5d1f16d770d4b3977f3fe702b9))
+* port Recorder acquisition integrity and managed USB improvements ([d4d3a31](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/d4d3a316b7645788b054437dbd77c6e3783b1b8f))
+* restore Breathe and Nura streaming ([ba8cfe5](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/ba8cfe58785bba21aa76b4d277c50f58656a4c42))
+* settle reorder tails and callback-driven stream restarts ([d23e4f1](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/d23e4f1dcfb509d90593bbaa23a40e4ef2c4010a))
+
 ## [2.2.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.1.1...v2.2.0) (2026-08-24)
 
 

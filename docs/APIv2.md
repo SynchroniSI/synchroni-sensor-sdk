@@ -1,8 +1,10 @@
 # API Reference (v2)
 
-Overview of the `synchroni_sensor_sdk` package. For the legacy API, see [API.md](./API.md).
+Overview of the `synchroni_sensor_sdk` package. The legacy `sensor` package is no
+longer included; existing applications must use an earlier release or migrate to
+this API.
 
-Goals relative to the legacy package:
+SDK design goals:
 1. Clean concurrency (async + sync wrappers over one driver stack).
 2. Typed public API (`SetParamCommand`, dataclasses) instead of string `setParam`/`getParam`.
 3. In-process Bleak on an asyncio loop (no multiprocess BLE host).
@@ -474,7 +476,7 @@ with SensorHub() as hub:
 | Parse watchdog (illegal package jump) | Implemented (clear assemble buffers + stream restart) |
 | `lost_package_count` on `SensorData` | Implemented |
 | `configure_logging` | Implemented (stdlib) |
-| WinRT high-throughput / `SENSOR_SDK_FORCE_NO_ACK` | Optional import-side patches (mirrored from legacy) |
+| WinRT high-throughput / `SENSOR_SDK_FORCE_NO_ACK` | BLE patches within the v2 driver package |
 | `power_off` / `system_reset` / `get_temperature` | Implemented |
 | Device-found callback | Implemented |
 | Exception taxonomy | Implemented and exported |

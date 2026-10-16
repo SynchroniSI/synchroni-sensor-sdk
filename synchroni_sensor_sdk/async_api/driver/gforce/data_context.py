@@ -1388,7 +1388,6 @@ class DataContext:
     async def start_streaming(self) -> bool:
         if self._is_data_transfering:
             raise DataNotificationInProgressError("Data collection is already in progress.")
-            return True
         self._is_data_transfering = True
         self._drain_queue(self._rawDataBuffer)
         self._universal_stop_response_candidate = None

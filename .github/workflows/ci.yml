@@ -36,7 +36,7 @@ jobs:
         run: poetry run ruff check synchroni_sensor_sdk
 
       - name: Mypy
-        run: poetry run mypy synchroni_sensor_sdk sensor
+        run: poetry run mypy synchroni_sensor_sdk
 
       - name: Pytest
         run: poetry run pytest tests/ -v

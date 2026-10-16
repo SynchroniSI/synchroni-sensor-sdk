@@ -1,4 +1,4 @@
-"""Console demo using synchroni_sensor_sdk (v2 sync API). Mirrors examples/console.py."""
+"""Console demo using synchroni_sensor_sdk (v2 sync API)."""
 
 from __future__ import annotations
 

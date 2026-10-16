@@ -1,4 +1,4 @@
-"""CRC helpers ported from legacy sensor_utils."""
+"""Shared table-based CRC helpers for both SDK APIs."""
 
 crc8Table = [
     0x00,

@@ -326,21 +326,6 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _windows_cmdline_arg(value: str) -> str:
-    """Quote one argument for a Windows process command line."""
-    if not value:
-        return '""'
-    if any(ch in value for ch in ' \t"&<>|()^%'):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return value
-
-
-def _windows_argument_list(args: list[str]) -> str:
-    """Join argv into a single Start-Process -ArgumentList string."""
-    return " ".join(_windows_cmdline_arg(a) for a in args)
-
-
 def require_claimable(adapter: BluetoothAdapter) -> None:
     """Raise if adapter explicitly needs claim before managed connect."""
     if adapter.claim_required:

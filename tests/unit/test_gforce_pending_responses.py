@@ -12,7 +12,6 @@ from bleak import BLEDevice
 
 from synchroni_sensor_sdk.async_api.driver.gforce.protocol import (
     COMMAND_MIN_INTERVAL_S,
-    FILTER_CMD_COOLDOWN_S,
     SAME_OPCODE_COOLDOWN_S,
     Command,
     CommandResponseError,
@@ -104,7 +103,14 @@ async def test_driver_init_clears_pending_responses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_command_min_interval_waits_between_sends() -> None:
+@pytest.mark.parametrize(
+    ("previous", "following"),
+    [
+        (Command.GET_BATTERY_LEVEL, Command.GET_FEATURE_MAP),
+        (Command.CMD_SET_FRIMWARE_FILTER_SWITCH, Command.CMD_GET_FRIMWARE_FILTER_SWITCH),
+    ],
+)
+async def test_command_min_interval_waits_between_sends(previous, following) -> None:
     protocol = _protocol()
     writes: list[float] = []
 
@@ -113,13 +119,13 @@ async def test_command_min_interval_waits_between_sends() -> None:
         writes.append(time.monotonic())
 
     protocol.client = SimpleNamespace(write_gatt_char=write_gatt)
-    protocol._record_command_complete(Command.GET_BATTERY_LEVEL)
+    protocol._record_command_complete(previous)
     protocol._last_any_cmd_end_mono = time.monotonic()
 
     t0 = time.monotonic()
-    await protocol._send_request(Request(cmd=Command.GET_FEATURE_MAP, has_res=False))
+    await protocol._send_request(Request(cmd=following, has_res=False))
     elapsed = time.monotonic() - t0
-    assert elapsed >= COMMAND_MIN_INTERVAL_S * 0.9
+    assert COMMAND_MIN_INTERVAL_S * 0.9 <= elapsed < 0.5
     assert len(writes) == 1
 
 
@@ -136,21 +142,6 @@ async def test_same_opcode_cooldown_waits() -> None:
     protocol._last_cmd_end_mono[Command.GET_BATTERY_LEVEL] = time.monotonic() - (SAME_OPCODE_COOLDOWN_S - 0.05)
     t0 = time.monotonic()
     await protocol._send_request(Request(cmd=Command.GET_BATTERY_LEVEL, has_res=False))
-    assert time.monotonic() - t0 >= 0.04
-
-
-@pytest.mark.asyncio
-async def test_filter_cmd_cooldown_between_filter_family() -> None:
-    protocol = _protocol()
-    protocol.client = SimpleNamespace(write_gatt_char=AsyncMock())
-    protocol._last_filter_cmd_end_mono = time.monotonic() - (FILTER_CMD_COOLDOWN_S - 0.05)
-    protocol._last_any_cmd_end_mono = 0.0
-    protocol._last_cmd_end_mono.clear()
-
-    t0 = time.monotonic()
-    await protocol._send_request(
-        Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=False),
-    )
     assert time.monotonic() - t0 >= 0.04
 
 

@@ -15,7 +15,6 @@ import asyncio
 import ctypes
 import functools
 import logging
-import os
 import platform
 import threading
 import time
@@ -34,19 +33,22 @@ RFSTAR_SERVICE_GUID = "00001812-0000-1000-8000-00805f9b34fb"
 
 
 try:
-    from bumble import hci
+    from bumble import hci, l2cap, utils
     from bumble.core import UUID
-    from bumble.device import Advertisement, AdvertisingData, Device, Peer
+    from bumble.device import Advertisement, AdvertisingData, ConnectionParametersPreferences, Device, Peer
     from bumble.hci import Address
     from bumble.transport import open_transport
     from bumble.transport.usb import UsbPacketSource
 except ImportError:  # pragma: no cover - exercised via _require_bumble
     hci = None  # type: ignore[assignment]
+    l2cap = None  # type: ignore[assignment]
+    utils = None  # type: ignore[assignment]
     UUID = None  # type: ignore[misc,assignment]
     Advertisement = None  # type: ignore[misc,assignment]
     AdvertisingData = None  # type: ignore[misc,assignment]
     Device = None  # type: ignore[misc,assignment]
     Peer = None  # type: ignore[misc,assignment]
+    ConnectionParametersPreferences = None  # type: ignore[misc,assignment]
     Address = None  # type: ignore[misc,assignment]
     open_transport = None  # type: ignore[assignment]
     UsbPacketSource = None  # type: ignore[misc,assignment]
@@ -61,11 +63,10 @@ MANAGED_USB_POWER_OFF_TIMEOUT_S = 3.0
 MANAGED_USB_SCAN_COMMAND_TIMEOUT_S = 5.0
 MANAGED_USB_POST_CLOSE_SETTLE_S = 0.5
 MANAGED_USB_POST_CLOSE_STUCK_SETTLE_S = 1.25
-# Keep a bounded 64 KiB of ACL reads submitted so short host scheduling stalls
+# Keep a bounded 512 KiB of ACL reads submitted so short host scheduling stalls
 # do not leave the dongle without receive buffers.
-MANAGED_USB_ACL_IN_TRANSFER_COUNT = 16
+MANAGED_USB_ACL_IN_TRANSFER_COUNT = 128
 MANAGED_USB_USB_READ_SIZE = 4096
-MANAGED_USB_ACL_IN_TRANSFER_COUNT_ENV = "SYNCHRONI_MANAGED_USB_ACL_IN_TRANSFER_COUNT"
 MANAGED_USB_DIAGNOSTIC_LOG_INTERVAL_S = 60.0
 _MANAGED_USB_ACL_PIPELINE_PLATFORMS = frozenset(("Darwin", "Windows"))
 _MANAGED_USB_ACL_PIPELINE_TRANSFERS_ATTR = "_synchroni_acl_pipeline_transfers"
@@ -75,7 +76,16 @@ _MANAGED_USB_TRANSFER_DIAGNOSTICS_PATCH_ATTR = "_synchroni_transfer_diagnostics_
 _MACOS_QOS_CLASS_USER_INITIATED = 0x19
 _WINDOWS_THREAD_PRIORITY_HIGHEST = 2
 _MANAGED_USB_DEFAULT_ATT_MTU = 23
-_MANAGED_USB_REQUESTED_ATT_MTU = 247
+_MANAGED_USB_REQUESTED_ATT_MTU = 251
+# Orion requests its MTU 14-20 ms after connection in captured traffic. One
+# peer-initiated exchange sets both directions, so avoid a redundant crossed request.
+_MANAGED_USB_PEER_MTU_GRACE_S = 0.1
+_MANAGED_USB_CONNECTION_INTERVAL_MS = 7.5
+_MANAGED_USB_CONNECTION_LATENCY = 0
+_MANAGED_USB_SUPERVISION_TIMEOUT_MS = 3000
+_MANAGED_USB_PEER_UPDATE_DELAY_S = 0.3
+_MANAGED_USB_CONNECTION_POLICY_ATTR = "_synchroni_connection_policy_installed"
+_MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR = "_synchroni_retain_initial_connection_interval"
 
 # Retain in-flight transport closes so wait_for timeouts do not cancel and leave USB claimed.
 # Keyed by transport_name so the next open can wait for the same dongle to go idle.
@@ -95,6 +105,55 @@ if hci is not None:
             hci.HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND,
         )
     )
+
+
+def _install_managed_usb_connection_policy(device: Any) -> bool:
+    """Start at 7.5 ms and apply the per-connection peer-update policy."""
+    manager = getattr(device, "l2cap_channel_manager", None)
+    if l2cap is None or manager is None or getattr(manager, _MANAGED_USB_CONNECTION_POLICY_ATTR, False) is True:
+        return False
+    original = manager.on_l2cap_connection_parameter_update_request
+
+    async def issue_update(connection: Any, handle: int, request: Any) -> None:
+        try:
+            await connection.cancel_on_disconnection(asyncio.sleep(_MANAGED_USB_PEER_UPDATE_DELAY_S))
+            if device.lookup_connection(handle) is not connection:
+                return
+            retain_initial = getattr(connection, _MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR, False) is True
+            initial_units = int(_MANAGED_USB_CONNECTION_INTERVAL_MS / 1.25)
+            await connection.cancel_on_disconnection(
+                manager.host.send_async_command(
+                    hci.HCI_LE_Connection_Update_Command(
+                        connection_handle=handle,
+                        connection_interval_min=initial_units if retain_initial else request.interval_min,
+                        connection_interval_max=initial_units if retain_initial else request.interval_max,
+                        max_latency=request.latency,
+                        supervision_timeout=request.timeout,
+                        min_ce_length=0,
+                        max_ce_length=0,
+                    )
+                )
+            )
+        except asyncio.CancelledError:
+            return
+
+    def on_request(connection: Any, cid: int, request: Any) -> None:
+        if connection.role != hci.Role.CENTRAL:
+            original(connection, cid, request)
+            return
+        manager.send_control_frame(
+            connection,
+            cid,
+            l2cap.L2CAP_Connection_Parameter_Update_Response(
+                identifier=request.identifier,
+                result=l2cap.L2CAP_CONNECTION_PARAMETERS_ACCEPTED_RESULT,
+            ),
+        )
+        utils.AsyncRunner.spawn(issue_update(connection, connection.handle, request))
+
+    manager.on_l2cap_connection_parameter_update_request = on_request
+    setattr(manager, _MANAGED_USB_CONNECTION_POLICY_ATTR, True)
+    return True
 
 
 @dataclass
@@ -208,27 +267,6 @@ def _safe_transfer_int(transfer: Any, method_name: str) -> int:
         return -1
 
 
-def _managed_usb_acl_in_transfer_count() -> int:
-    """Return the default or explicit bounded A/B transfer count."""
-
-    raw = os.getenv(MANAGED_USB_ACL_IN_TRANSFER_COUNT_ENV)
-    if raw is None or raw.strip() == "":
-        return MANAGED_USB_ACL_IN_TRANSFER_COUNT
-    try:
-        requested = int(raw)
-    except ValueError:
-        requested = -1
-    if requested in (1, MANAGED_USB_ACL_IN_TRANSFER_COUNT):
-        return requested
-    logger.warning(
-        "Ignoring invalid %s=%r; expected 1 or %s",
-        MANAGED_USB_ACL_IN_TRANSFER_COUNT_ENV,
-        raw,
-        MANAGED_USB_ACL_IN_TRANSFER_COUNT,
-    )
-    return MANAGED_USB_ACL_IN_TRANSFER_COUNT
-
-
 def _install_bumble_usb_transfer_diagnostics() -> None:
     """Wrap Bumble before transport creation so every bulk completion is counted."""
 
@@ -277,11 +315,12 @@ class ManagedUsbRadioSession:
             if self._device is not None and getattr(self._device, "powered_on", False):
                 return self._device
 
-            await _await_usb_idle(self.transport_name)
             if self._transport is not None:
-                await _close_managed_usb_transport(self._transport, transport_name=self.transport_name)
+                transport = self._transport
                 self._transport = None
                 self._device = None
+                await _close_managed_usb_transport(transport, transport_name=self.transport_name)
+            await _await_usb_idle(self.transport_name)
 
             await _prepare_managed_usb_session(self.transport_name)
             _install_bumble_usb_transfer_diagnostics()
@@ -292,17 +331,21 @@ class ManagedUsbRadioSession:
                 transport_name=self.transport_name,
             )
             hci_source, hci_sink = self._transport
+            # Reset the USB OUT sequence before the controller receives its first ACL packet.
+            await asyncio.to_thread(hci_sink.device.clearHalt, hci_sink.bulk_out.getAddress())
             self._ingress_diagnostics = _enable_managed_usb_acl_read_pipeline(
                 hci_source,
                 transport_name=self.transport_name,
             )
             self._device = Device.with_hci(
                 "Synchroni USB BLE",
-                Address("F0:F1:F2:F3:F4:F5"),
+                Address.ANY_RANDOM,
                 hci_source,
                 hci_sink,
             )
+            self._device.gatt_server.max_mtu = _MANAGED_USB_REQUESTED_ATT_MTU
             _disable_problematic_managed_usb_commands(self._device)
+            _install_managed_usb_connection_policy(self._device)
             await _await_managed_usb_stage(
                 self._device.power_on(),
                 timeout_s=MANAGED_USB_POWER_ON_TIMEOUT_S,
@@ -361,17 +404,19 @@ class ManagedUsbRadioSession:
             self._device = None
             self._transport = None
             self._ingress_diagnostics = None
-            if device is not None and getattr(device, "powered_on", False):
-                await _soft_await(
-                    device.power_off(),
-                    timeout_s=MANAGED_USB_POWER_OFF_TIMEOUT_S,
-                    stage="controller power off",
-                    transport_name=self.transport_name,
-                    retain_on_timeout=False,
-                )
-            if transport is not None:
-                await _close_managed_usb_transport(transport, transport_name=self.transport_name)
-                await asyncio.sleep(MANAGED_USB_POST_CLOSE_SETTLE_S)
+            try:
+                if device is not None and getattr(device, "powered_on", False):
+                    await _soft_await(
+                        device.power_off(),
+                        timeout_s=MANAGED_USB_POWER_OFF_TIMEOUT_S,
+                        stage="controller power off",
+                        transport_name=self.transport_name,
+                        retain_on_timeout=False,
+                    )
+            finally:
+                if transport is not None:
+                    await _close_managed_usb_transport(transport, transport_name=self.transport_name)
+                    await asyncio.sleep(MANAGED_USB_POST_CLOSE_SETTLE_S)
             if diagnostics is not None:
                 diagnostics.maybe_log(force=True)
             logger.info("Managed USB radio session closed: %s", self.transport_name)
@@ -481,7 +526,6 @@ def _enable_managed_usb_acl_read_pipeline(
     source: Any,
     *,
     transport_name: str = "unknown",
-    transfer_count: int | None = None,
 ) -> _ManagedUsbIngressDiagnostics | None:
     """Keep several bulk-IN reads queued on hosts susceptible to receive gaps.
 
@@ -494,13 +538,10 @@ def _enable_managed_usb_acl_read_pipeline(
     if platform_name not in _MANAGED_USB_ACL_PIPELINE_PLATFORMS:
         return None
 
-    selected_transfer_count = _managed_usb_acl_in_transfer_count() if transfer_count is None else transfer_count
-    if selected_transfer_count not in (1, MANAGED_USB_ACL_IN_TRANSFER_COUNT):
-        raise ValueError(f"Managed USB ACL transfer count must be 1 or {MANAGED_USB_ACL_IN_TRANSFER_COUNT}")
     diagnostics = _install_managed_usb_ingress_diagnostics(
         source,
         transport_name=transport_name,
-        transfer_count=selected_transfer_count,
+        transfer_count=MANAGED_USB_ACL_IN_TRANSFER_COUNT,
     )
 
     required_attributes = (
@@ -522,7 +563,7 @@ def _enable_managed_usb_acl_read_pipeline(
         logger.warning("Managed USB ACL pipeline marker has an unexpected type; keeping existing reads")
         return diagnostics
 
-    additional_transfer_count = selected_transfer_count - 1 - len(pipeline_transfers)
+    additional_transfer_count = MANAGED_USB_ACL_IN_TRANSFER_COUNT - 1 - len(pipeline_transfers)
     if additional_transfer_count <= 0:
         logger.info(
             "Managed USB %s ACL read pipeline active with %s transfer(s)",
@@ -581,10 +622,12 @@ class ManagedUsbBleClient:
         transport_name: str,
         peer_address: str,
         disconnected_callback: Callable[[Any], None] | None = None,
+        retain_initial_interval: bool = False,
     ) -> None:
         self._transport_name = transport_name
         self._peer_address = peer_address
         self._disconnected_callback = disconnected_callback
+        self._retain_initial_interval = retain_initial_interval
         self._radio: ManagedUsbRadioSession | None = None
         self._device: Device | None = None
         self._peer: Peer | None = None
@@ -621,11 +664,23 @@ class ManagedUsbBleClient:
             self._device = await self._radio.ensure_ready()
             assert self._device is not None
             self._connection = await _await_managed_usb_stage(
-                self._device.connect(self._peer_address),
+                self._device.connect(
+                    self._peer_address,
+                    connection_parameters_preferences={
+                        hci.Phy.LE_1M: ConnectionParametersPreferences(
+                            connection_interval_min=_MANAGED_USB_CONNECTION_INTERVAL_MS,
+                            connection_interval_max=_MANAGED_USB_CONNECTION_INTERVAL_MS,
+                            max_latency=_MANAGED_USB_CONNECTION_LATENCY,
+                            supervision_timeout=_MANAGED_USB_SUPERVISION_TIMEOUT_MS,
+                        )
+                    },
+                ),
                 timeout_s=MANAGED_USB_POWER_ON_TIMEOUT_S,
                 stage="peer connect",
                 transport_name=self._transport_name,
             )
+            if self._retain_initial_interval:
+                setattr(self._connection, _MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR, True)
             self._connection.on("disconnection", self._on_disconnection)
             self._peer = Peer(self._connection)
             await self._request_larger_mtu()
@@ -700,7 +755,10 @@ class ManagedUsbBleClient:
         await peer.write_value(characteristic, bytes(data), with_response=response)
 
     def _on_disconnection(self, *_args: object) -> None:
+        was_connected = self.is_connected
         self.is_connected = False
+        if not was_connected:
+            return
         if not self._disconnecting:
             self._schedule_transport_loss_cleanup()
         if self._disconnected_callback is not None:
@@ -713,16 +771,26 @@ class ManagedUsbBleClient:
 
     async def _request_larger_mtu(self) -> None:
         peer = self._require_peer()
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("Managed USB BLE client is not connected.")
+
+        peer_mtu_updated = asyncio.Event()
+        event_name = connection.EVENT_CONNECTION_ATT_MTU_UPDATE
+        on_peer_mtu_updated = peer_mtu_updated.set
+        connection.on(event_name, on_peer_mtu_updated)
         try:
-            negotiated_mtu = await peer.request_mtu(_MANAGED_USB_REQUESTED_ATT_MTU)
-        except Exception as exc:
-            logger.info(
-                "Managed USB BLE peer kept default ATT MTU %s; MTU request failed: %s",
-                self._mtu_size,
-                exc,
-            )
-            return
-        self._mtu_size = int(negotiated_mtu)
+            if int(connection.att_mtu) == _MANAGED_USB_DEFAULT_ATT_MTU:
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(peer_mtu_updated.wait(), _MANAGED_USB_PEER_MTU_GRACE_S)
+
+            if peer_mtu_updated.is_set() or int(connection.att_mtu) != _MANAGED_USB_DEFAULT_ATT_MTU:
+                self._mtu_size = int(connection.att_mtu)
+                return
+
+            self._mtu_size = int(await peer.request_mtu(_MANAGED_USB_REQUESTED_ATT_MTU))
+        finally:
+            connection.remove_listener(event_name, on_peer_mtu_updated)
 
     async def _get_characteristic(self, uuid: str) -> Any:
         peer = self._require_peer()
@@ -1036,6 +1104,15 @@ async def _soft_await(
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=max(timeout_s, 0.1))
         return True
+    except asyncio.CancelledError:
+        if not task.done():
+            if retain_on_timeout:
+                _track_background_task(transport_name, task)
+            else:
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+        raise
     except TimeoutError:
         logger.warning(
             "Managed USB %s still running after %.1fs on %s; %s",
@@ -1117,17 +1194,21 @@ async def _await_usb_idle(transport_name: str, timeout_s: float = 15.0) -> None:
     )
     try:
         await asyncio.wait_for(
-            asyncio.gather(*pending, return_exceptions=True),
+            asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),
             timeout=max(timeout_s, 0.1),
         )
-    except TimeoutError:
+    except TimeoutError as exc:
         still_running = sum(1 for t in pending if not t.done())
         logger.warning(
-            "Managed USB still busy on %s after %.1fs (%s task(s) running); continuing",
+            "Managed USB still busy on %s after %.1fs (%s task(s) running); refusing to reopen",
             transport_name,
             timeout_s,
             still_running,
         )
+        raise TimeoutError(
+            f"Managed USB is still busy on {transport_name} after {timeout_s:.1f}s; "
+            "refusing to reopen before close completes"
+        ) from exc
 
 
 async def _finish_managed_usb_scan(

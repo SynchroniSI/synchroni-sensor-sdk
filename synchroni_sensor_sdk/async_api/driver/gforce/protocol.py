@@ -24,8 +24,6 @@ from synchroni_sensor_sdk.async_api.driver.ingress import MAX_NOTIFICATION_BYTES
 COMMAND_MIN_INTERVAL_S = 0.075
 # Same-opcode cool-down: replaces the old "timestamp in response queue" / skip-if-too-fast rule.
 SAME_OPCODE_COOLDOWN_S = 3.0
-# Extra cool-down for firmware filter set/get (recorder RESPONSE_REUSE_GUARD ~3.05s).
-FILTER_CMD_COOLDOWN_S = 3.05
 MANAGED_USB_ACK_COMMAND_ATTEMPTS = 2
 # Wristband firmware can fragment command notifications when it retains the
 # default ATT MTU. Fragments use reverse-order sequence numbers (N ... 0).
@@ -190,15 +188,6 @@ class Command(IntEnum):
     MD_PARTIAL_DATA = 0xFF
 
 
-# Firmware filter family — needs longer cool-down than generic set_param writes.
-FILTER_COMMANDS: frozenset[Command] = frozenset(
-    {
-        Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
-        Command.CMD_GET_FRIMWARE_FILTER_SWITCH,
-    }
-)
-
-
 class DataSubscription(IntEnum):
     # Data Notify All Off
     OFF = (0x00000000,)
@@ -320,6 +309,7 @@ class EmgRawDataConfig:
     channel_mask: int = 0xFF
     batch_len: int = 16
     resolution: SampleResolution = SampleResolution.BITS_8
+    extension: int | None = None
 
     def to_bytes(self) -> bytes:
         body = b""
@@ -327,19 +317,21 @@ class EmgRawDataConfig:
         body += struct.pack("<H", self.channel_mask)
         body += struct.pack("<B", self.batch_len)
         body += struct.pack("<B", self.resolution)
+        if self.extension is not None:
+            body += struct.pack("<B", self.extension)
         return body
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
-        fs, channel_mask, batch_len, resolution = struct.unpack(
-            "<HHBB",
-            data,
-        )
+        if len(data) not in (6, 7):
+            raise ValueError(f"EMG raw data config must be 6 or 7 bytes, got {len(data)}")
+        fs, channel_mask, batch_len, resolution = struct.unpack("<HHBB", data[:6])
         return cls(
             SamplingRate(fs),
             channel_mask,
             batch_len,
             SampleResolution(resolution),
+            data[6] if len(data) == 7 else None,
         )
 
 
@@ -609,7 +601,6 @@ class GForceProtocol:
         self._cmd_lock = asyncio.Lock()
         self._last_any_cmd_end_mono: float = 0.0
         self._last_cmd_end_mono: dict[Command, float] = {}
-        self._last_filter_cmd_end_mono: float = 0.0
 
     def _schedule_cmd_response(self, bs: bytes) -> None:
         asyncio.create_task(self.async_on_cmd_response(bs))
@@ -721,6 +712,7 @@ class GForceProtocol:
                 transport_name=self._managed_usb_transport,
                 peer_address=self._managed_usb_peer_address,
                 disconnected_callback=disconnect_cb,
+                retain_initial_interval=True,
             )
             self.client = client
             try:
@@ -1140,11 +1132,13 @@ class GForceProtocol:
 
     async def set_firmware_filter_switch(self, switchStatus: int) -> bool:
         try:
-            await self._send_request(
-                Request(
-                    cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
-                    body=bytes([0xFF & switchStatus]),
-                    has_res=True,
+            _response_bytes(
+                await self._send_request(
+                    Request(
+                        cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH,
+                        body=bytes([0xFF & switchStatus]),
+                        has_res=True,
+                    )
                 )
             )
         except CommandResponseError as error:
@@ -1174,11 +1168,13 @@ class GForceProtocol:
 
     async def set_emg_raw_data_config(self, cfg: EmgRawDataConfig = EmgRawDataConfig()) -> None:
         body = cfg.to_bytes()
-        await self._send_request(
-            Request(
-                cmd=Command.SET_EMG_RAWDATA_CONFIG,
-                body=body,
-                has_res=True,
+        _response_bytes(
+            await self._send_request(
+                Request(
+                    cmd=Command.SET_EMG_RAWDATA_CONFIG,
+                    body=body,
+                    has_res=True,
+                )
             )
         )
 
@@ -1230,11 +1226,13 @@ class GForceProtocol:
         return EegRawDataConfig.from_bytes(buf)
 
     async def set_eeg_raw_data_config(self, cfg: EegRawDataConfig) -> None:
-        await self._send_request(
-            Request(
-                cmd=Command.CMD_SET_EEG_CONFIG,
-                body=cfg.to_bytes(),
-                has_res=True,
+        _response_bytes(
+            await self._send_request(
+                Request(
+                    cmd=Command.CMD_SET_EEG_CONFIG,
+                    body=cfg.to_bytes(),
+                    has_res=True,
+                )
             )
         )
 
@@ -1261,11 +1259,13 @@ class GForceProtocol:
         return EcgRawDataConfig.from_bytes(buf)
 
     async def set_ecg_raw_data_config(self, cfg: EcgRawDataConfig) -> None:
-        await self._send_request(
-            Request(
-                cmd=Command.CMD_SET_ECG_CONFIG,
-                body=cfg.to_bytes(),
-                has_res=True,
+        _response_bytes(
+            await self._send_request(
+                Request(
+                    cmd=Command.CMD_SET_ECG_CONFIG,
+                    body=cfg.to_bytes(),
+                    has_res=True,
+                )
             )
         )
 
@@ -1429,30 +1429,26 @@ class GForceProtocol:
             self._unblock_response_queue(q)
 
     async def _await_command_cooldown(self, cmd: Command) -> None:
-        """Sleep until min-interval / same-opcode / filter cool-downs have elapsed."""
+        """Sleep until min-interval / same-opcode cool-downs have elapsed."""
         now = time.monotonic()
         deadlines = [
             self._last_any_cmd_end_mono + COMMAND_MIN_INTERVAL_S,
             self._last_cmd_end_mono.get(cmd, 0.0) + SAME_OPCODE_COOLDOWN_S,
         ]
-        if cmd in FILTER_COMMANDS:
-            deadlines.append(self._last_filter_cmd_end_mono + FILTER_CMD_COOLDOWN_S)
         delay = max(0.0, max(deadlines) - now)
         if delay > 0:
             await asyncio.sleep(delay)
 
     def _record_command_complete(self, cmd: Command) -> None:
         now = time.monotonic()
-        self._last_any_cmd_end_mono = now
+        if not self._is_universal_stream:
+            self._last_any_cmd_end_mono = now
         self._last_cmd_end_mono[cmd] = now
-        if cmd in FILTER_COMMANDS:
-            self._last_filter_cmd_end_mono = now
 
     def _reset_command_pacing(self) -> None:
         """Reset cool-down clocks on connect so a new session is not delayed."""
         self._last_any_cmd_end_mono = 0.0
         self._last_cmd_end_mono.clear()
-        self._last_filter_cmd_end_mono = 0.0
 
     async def _send_request(self, req: Request) -> bytes | None:
         attempts = MANAGED_USB_ACK_COMMAND_ATTEMPTS if self._managed_usb_transport is not None and req.has_res else 1
@@ -1472,41 +1468,32 @@ class GForceProtocol:
         raise RuntimeError(f"Managed USB command {req.cmd.name} returned no response after {attempts} attempts")
 
     async def _send_request_internal(self, req: Request) -> bytes | None:
-        """Send one protocol command under the serial lock with cool-downs.
-
-        Commands never stamp timestamps into the response queue. In-flight
-        exchanges are exclusive via ``_cmd_lock``; cool-downs wait rather than
-        drop the request.
-        """
+        """Send one serialized protocol command with device cool-downs."""
         async with self._cmd_lock:
             await self._await_command_cooldown(req.cmd)
 
             q: asyncio.Queue[CommandReply] | None = None
-            if req.has_res:
-                # Fresh channel for this exchange (any prior waiters were clear-ed).
-                self._clear_response_channel(req.cmd)
-                q = self._get_response_channel(req.cmd)
-                # Drain leftover (should be empty); keep only a clean receive buffer.
-                while not q.empty():
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
             bs = bytes([req.cmd])
             if req.body is not None:
                 bs += req.body
 
-            # RFSTAR acknowledges protocol commands through its notification
-            # channel, not through an ATT write response.  If response is left
-            # unspecified, Bleak selects write-with-response on macOS and
-            # CoreBluetooth forcibly disconnects after its 30-second ATT timeout.
-            response = False if self._is_universal_stream else None
             try:
-                await asyncio.wait_for(
-                    self._require_client().write_gatt_char(self.cmd_char, bs, response=response),
-                    timeout=1,
-                )
+                client = self._require_client()
+                if req.has_res:
+                    self._clear_response_channel(req.cmd)
+                    q = self._get_response_channel(req.cmd)
+                # Universal commands acknowledge through notifications, not ATT write responses.
+                response = False if self._is_universal_stream else None
+                try:
+                    await asyncio.wait_for(client.write_gatt_char(self.cmd_char, bs, response=response), timeout=1)
+                finally:
+                    if self._is_universal_stream:
+                        self._last_any_cmd_end_mono = time.monotonic()
+            except asyncio.CancelledError:
+                if req.has_res:
+                    self._clear_response_channel(req.cmd)
+                self._record_command_complete(req.cmd)
+                raise
             except Exception:
                 if req.has_res:
                     self._clear_response_channel(req.cmd)
@@ -1514,7 +1501,6 @@ class GForceProtocol:
                 return None
 
             if not req.has_res:
-                self._clear_response_channel(req.cmd)
                 self._record_command_complete(req.cmd)
                 return None
 
@@ -1522,10 +1508,10 @@ class GForceProtocol:
             try:
                 ret = await asyncio.wait_for(q.get(), 2)
             except TimeoutError:
+                return None
+            finally:
                 self._clear_response_channel(req.cmd)
                 self._record_command_complete(req.cmd)
-                return None
-            self._record_command_complete(req.cmd)
             if isinstance(ret, CommandResponseError):
                 raise ret
             return ret

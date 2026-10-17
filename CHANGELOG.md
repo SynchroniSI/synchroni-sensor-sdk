@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.0.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.2.1...v3.0.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove legacy sensor API and unused SDK paths
+
+### Performance Improvements
+
+* reduce connection setup and stabilize device streaming ([0889b65](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/0889b654fcafb8c09e5d8d6a1f8c42a822edd0a2))
+
+
+### Code Refactoring
+
+* remove legacy sensor API and unused SDK paths ([5aa45ca](https://github.com/SynchroniSI/synchroni-sensor-sdk/commit/5aa45ca11fb8341cfddd8ecdb5c077dcb133762e))
+
 ## [2.2.1](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.2.0...v2.2.1) (2026-09-12)
 
 

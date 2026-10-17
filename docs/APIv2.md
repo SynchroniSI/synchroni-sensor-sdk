@@ -266,6 +266,29 @@ Rules of thumb:
 4. Keep one active GATT connection per managed dongle.
 5. Call `hub.close()` (context exit) when the session ends so USB is released.
 
+The sync example above connects and starts each sensor sequentially. With the
+async API, callers can schedule setup coroutines for different devices together
+using `asyncio.gather`, then do the same for their `start_streaming()` calls.
+Keep `connect` → optional `set_param` → `init` → callback registration → start in
+order for each device, with distinct device/dongle assignments. Application
+commands remain serialized within each device. The SDK does not schedule a group
+start automatically or synchronize the devices' sample clocks.
+
+#### Managed USB connection policy
+
+| Setting | Policy |
+|---------|--------|
+| ATT MTU | Request and server maximum 251; accept a peer exchange first, with a host request after 100 ms if the MTU is still at its default. The negotiated value depends on the peer. |
+| Connection interval | Request and retain 7.5 ms. Initial peripheral latency is 0 and supervision timeout is 3000 ms; later peer latency/timeout updates are honored after a 300 ms delay. |
+| Controller identity | Distinct static-random address per controller. |
+| Receive buffering | Queue 128 reads of 4096 bytes on macOS/Windows. |
+
+These are managed USB policies; system Bluetooth remains controlled by the OS.
+Application command pacing uses 75 ms minimum spacing and a three-second
+same-opcode cooldown. Filter writes keep SET acknowledgements and validating GETs
+without an additional filter-family wait. Initialization performs required
+layout, calibration and scaling reads while reusing configuration already read.
+
 #### Lifecycle: claims, disconnect, close
 
 ```
@@ -380,7 +403,23 @@ for connection identity (not part of ``DeviceInfo``).
 | Filters | `enable_filter_50hz/60hz/hpf/lpf` |
 | Other | `debug_ble_data_path`, `neucir_mode`, `neucir_app_control` |
 
-Pre-init `set_param` only updates the NTF/filter maps used by subsequent `init`. After init, NTF changes rebuild the subscription mask (and restart streaming if active). Filters apply immediately via firmware switch.
+Pre-init `set_param` stages stream, rate, and filter settings for `init`. Filter SET runs at the start of initialization and its validating GET runs before initialization succeeds. After init, NTF changes rebuild the subscription mask (and restart streaming if active). Post-init filters apply immediately with the same SET and validating GET. Other successful configuration commands are treated as authoritative and are not followed by verification GETs; setup still reads configuration or capability data needed for stream layout, calibration, scaling, or unspecified settings.
+EEG, ECG and EMG initialization each read the initial configuration once, reuse it when applying requested settings, and skip post-write verification reads. Initialization reuses the ECG configuration read while configuring EEG. `device_info()` uses initialized metadata, and reconnect creates a fresh data context.
+Calling `set_param` while initialization is active raises `DataContextInitInProgressError` before applying any changes.
+
+### Force EMG modes
+
+| Device | Requested rate | Configuration and decoding |
+|--------|----------------|----------------------------|
+| gForce Pro+ | 500 Hz | 12-bit configuration, 240-byte EMG batches. |
+| gForce Pro+ | 1000 Hz | 8-bit configuration, 240-byte EMG batches. |
+| gForce Ultra | 500 or 1000 Hz | 240-byte EMG batches; native two-byte compressed samples at either rate. Accept legacy resolution 8 without an extension, or preserve extended resolution 16 with extension `0x0f`. |
+
+Ultra's two-byte transport encoding is separate from its ADC resolution. Read
+`DeviceInfo.sample_rates` after initialization for the configured rate; measuring
+received samples is required to verify delivered rate. Pro motion loss and some
+1000 Hz Pro EMG loss remain observed hardware-test limitations; these settings do
+not guarantee loss-free delivery.
 
 ### `BleChipType`
 

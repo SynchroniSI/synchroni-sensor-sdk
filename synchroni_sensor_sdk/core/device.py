@@ -234,7 +234,7 @@ GFORCE_PRO_PRODUCT_SPECIFICATION = ProductSpecification(
 OYWW1000_PRODUCT_SPECIFICATION = ProductSpecification(
     manufacturer="OYMotion",
     product_name="gForce Ultra",
-    model_aliases=("OYWW1000", "gForce Ultra"),
+    model_aliases=("OYWW1000", "gForce Ultra", "gForceUltra"),
     emg_channel_count=8,
     nominal_emg_sample_rate_hz=1000,
     adc_resolution_bits=24,
@@ -272,7 +272,7 @@ NATIVE_DEVICE_PROFILES: tuple[NativeDeviceProfile, ...] = (
     NativeDeviceProfile(
         profile_id="force_ultra",
         label="OYMotion gForce Ultra (OYWW1000)",
-        name_markers=("oyww1000", "oyww", "gforce ultra", "force ultra", "forceultra"),
+        name_markers=("oyww1000", "oyww", "gforce ultra", "gforceultra", "force ultra", "forceultra"),
         supported_streams=frozenset(("emg", "imu")),
         supported_filters=_ALL_FIRMWARE_FILTERS,
         configurable_emg_sample_rates_hz=(500, 1_000),

@@ -27,7 +27,11 @@ from synchroni_sensor_sdk.core.device import (
     SetParamCommand,
     native_device_profile,
 )
-from synchroni_sensor_sdk.core.exceptions import SensorNotInitializedError, SensorNotReadyError
+from synchroni_sensor_sdk.core.exceptions import (
+    DataContextInitInProgressError,
+    SensorNotInitializedError,
+    SensorNotReadyError,
+)
 from synchroni_sensor_sdk.core.params import FilterParam, NtfParam, ParamToggle
 
 
@@ -378,6 +382,9 @@ class GForceDriver(Driver):
         if self._data_context is None:
             raise SensorNotReadyError("Cannot set parameters: device was not connected.")
 
+        if self._data_context._is_initing:
+            raise DataContextInitInProgressError("Cannot set parameters while sensor initialization is in progress.")
+
         if self._streaming and (command.eeg_sample_rate_hz is not None or command.emg_sample_rate_hz is not None):
             raise SensorNotReadyError("Sample rates cannot be changed while streaming.")
 
@@ -444,7 +451,7 @@ class GForceDriver(Driver):
         if command.enable_filter_lpf is not None:
             filter_changes[FilterParam.FILTER_LPF] = ParamToggle.from_bool(command.enable_filter_lpf)
         if filter_changes:
-            await ctx.set_filters(filter_changes)
+            await ctx.set_filters(filter_changes, apply_to_device=self._inited)
 
         if command.eeg_sample_rate_hz is not None:
             await ctx.set_eeg_sample_rate(command.eeg_sample_rate_hz, apply_to_device=self._inited)

@@ -193,6 +193,13 @@ Pattern used in [examples/v2_console.py](examples/v2_console.py): queue reconnec
 
 All I/O is `await`ed on the caller's event loop. Prefer **async** callbacks (`async def`) so work can run without leaving the loop. If you register a sync callback, it still uses `asyncio.to_thread` and follows the same “no blocking hub calls from the callback” rule if you mix patterns incorrectly—prefer async handlers that `await` hub/sensor methods.
 
+Async calls in an awaited loop still run one at a time. To connect, initialize or
+start independent devices concurrently, schedule their coroutines together, for
+example with `asyncio.gather`. Keep each device's lifecycle in order and assign
+one device per managed USB dongle. Application commands remain serialized within
+each device; concurrent starts do not synchronize device sample clocks. See the
+[multi-device workflow and connection policy](docs/APIv2.md#workflow-f--multi-sensor-one-dongle-each).
+
 ## Documentation
 
 | Doc | Description |

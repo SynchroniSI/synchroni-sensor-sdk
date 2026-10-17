@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, patch
 
 from synchroni_sensor_sdk.async_api.driver.base import Driver
 from synchroni_sensor_sdk.async_api.driver.gforce.convert import sensor_data_to_public
-from synchroni_sensor_sdk.async_api.driver.gforce.data_context import DataContext, FeatureMaps
+from synchroni_sensor_sdk.async_api.driver.gforce.data_context import DataContext, FeatureMaps, SensorDataType
 from synchroni_sensor_sdk.async_api.driver.gforce.driver import GForceDriver
 from synchroni_sensor_sdk.async_api.driver.gforce.parsing_models import DataType, ParseSample, ParseSensorData
-from synchroni_sensor_sdk.async_api.driver.gforce.protocol import RawDataPacket
+from synchroni_sensor_sdk.async_api.driver.gforce.protocol import Command, RawDataPacket
 from synchroni_sensor_sdk.async_api.driver.ingress import BoundedThreadIngress
 from synchroni_sensor_sdk.async_api.sensor import Sensor
 from synchroni_sensor_sdk.core.data import NtfDataType, Sample, SensorData
@@ -406,3 +406,38 @@ async def test_public_conversion_preserves_fractional_values_and_receipt_time() 
     assert [packet.last_package_index for packet in received] == [0, 1]
     assert [packet.received_monotonic_ns for packet in received] == [1_000, 1_001]
     assert context._stale_packet_count == 0
+
+
+async def test_qat6_disabled_leading_channel_does_not_accumulate_samples():
+    _driver, _sensor, ctx, _raw = _imu_context()
+    published = []
+    ctx._publish_data = published.append
+    ctx.isContainQAT6 = True
+    quat = ParseSensorData()
+    quat.dataType, quat.sampleRate, quat.channelCount = DataType.NTF_QUATERNION, 50, 4
+    quat.channelMask, quat.packageIndexLength, quat.resolutionBits, quat.K = 14, 2, 31, 1.0
+    quat.packageSampleCount = quat.minPackageSampleCount = 1
+    quat.clear()
+    ctx.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION] = quat
+    for index in range(20):
+        ctx._processDataPackage(struct.pack("<BH6h3i", 0x13, index, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+    packets = [packet for packet in published if packet.data_type == DataType.NTF_QUATERNION]
+    assert len(packets) == 20
+    assert packets[0].channel_samples[0] == []
+    assert [channel[0].raw_data for channel in packets[0].channel_samples[1:]] == [7, 8, 9]
+    assert quat.channelSamples == [[], [], [], []]
+
+
+async def test_orion_stop_reply_escapes_incomplete_eeg_after_idle():
+    _driver, _sensor, ctx, _raw = _imu_context()
+    ctx.gForce.responses = {Command.SET_DATA_NOTIF_SWITCH: asyncio.Queue()}
+    ctx.gForce.async_on_cmd_response = AsyncMock()
+    ctx._universal_stop_started_ns = 1
+    await ctx._process_framed_packet(RawDataPacket(bytes.fromhex("556310ea17"), 1), universal=True)
+    await ctx._process_framed_packet(RawDataPacket(bytes.fromhex("aa02004f4440"), 2), universal=True)
+    await ctx._recover_universal_stop_response_after_idle()
+    ctx.gForce.async_on_cmd_response.assert_not_awaited()
+    ctx._universal_stop_last_packet_processed_ns = time.monotonic_ns() - 1_000_000_000
+    await ctx._recover_universal_stop_response_after_idle()
+    ctx.gForce.async_on_cmd_response.assert_awaited_once_with(b"\x00\x4f")
+    assert ctx._concatDataBuffer == b""

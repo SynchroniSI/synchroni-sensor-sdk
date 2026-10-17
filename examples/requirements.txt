@@ -1,4 +1,1 @@
 synchroni-sensor-sdk
-scipy
-matplotlib
-PyQt5

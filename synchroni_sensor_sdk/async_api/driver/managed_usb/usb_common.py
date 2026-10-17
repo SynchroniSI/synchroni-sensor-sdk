@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
+from synchroni_sensor_sdk.core.bluetooth import KNOWN_EEG_USB_DONGLES as KNOWN_USB_BLUETOOTH_VID_PID
 from synchroni_sensor_sdk.core.bluetooth import MANAGED_USB_ADAPTER_ID_PREFIX, BluetoothAdapter
 
 VID_PID_RE = re.compile(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", re.IGNORECASE)
@@ -19,13 +20,6 @@ USB_BLUETOOTH_ADAPTER_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 USB_USERSPACE_DRIVER_RE = re.compile(r"\b(winusb|libusb|libusbk|libusb0)\b", re.IGNORECASE)
-KNOWN_USB_BLUETOOTH_VID_PID = frozenset(
-    {
-        ("0a12", "0001"),  # Cambridge Silicon Radio CSR8510
-        ("10d7", "b012"),  # Actions "general adapter" dongles
-        ("2357", "0604"),  # TP-Link UB500 Adapter
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -230,11 +224,6 @@ def usb_device_path(usb_bus: int | None, usb_port_path: str | None) -> str | Non
     if usb_bus is None or usb_port_path is None or usb_port_path.strip() == "":
         return None
     return f"{usb_bus}-{usb_port_path.strip()}"
-
-
-def libusb_device_path(device: Any) -> str | None:
-    """Return the upstream path spelling using Recorder's shared topology parser."""
-    return usb_device_path(*libusb_device_topology(device))
 
 
 def libusb_device_is_bluetooth_hci(device: Any) -> bool:

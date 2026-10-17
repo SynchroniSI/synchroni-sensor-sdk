@@ -62,7 +62,6 @@ MANAGED_USB_POWER_ON_TIMEOUT_S = 15.0
 MANAGED_USB_POWER_OFF_TIMEOUT_S = 3.0
 MANAGED_USB_SCAN_COMMAND_TIMEOUT_S = 5.0
 MANAGED_USB_POST_CLOSE_SETTLE_S = 0.5
-MANAGED_USB_POST_CLOSE_STUCK_SETTLE_S = 1.25
 # Keep a bounded 512 KiB of ACL reads submitted so short host scheduling stalls
 # do not leave the dongle without receive buffers.
 MANAGED_USB_ACL_IN_TRANSFER_COUNT = 128
@@ -85,7 +84,6 @@ _MANAGED_USB_CONNECTION_LATENCY = 0
 _MANAGED_USB_SUPERVISION_TIMEOUT_MS = 3000
 _MANAGED_USB_PEER_UPDATE_DELAY_S = 0.3
 _MANAGED_USB_CONNECTION_POLICY_ATTR = "_synchroni_connection_policy_installed"
-_MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR = "_synchroni_retain_initial_connection_interval"
 
 # Retain in-flight transport closes so wait_for timeouts do not cancel and leave USB claimed.
 # Keyed by transport_name so the next open can wait for the same dongle to go idle.
@@ -108,7 +106,7 @@ if hci is not None:
 
 
 def _install_managed_usb_connection_policy(device: Any) -> bool:
-    """Start at 7.5 ms and apply the per-connection peer-update policy."""
+    """Start at 7.5 ms and retain that interval when peers request updates."""
     manager = getattr(device, "l2cap_channel_manager", None)
     if l2cap is None or manager is None or getattr(manager, _MANAGED_USB_CONNECTION_POLICY_ATTR, False) is True:
         return False
@@ -119,14 +117,13 @@ def _install_managed_usb_connection_policy(device: Any) -> bool:
             await connection.cancel_on_disconnection(asyncio.sleep(_MANAGED_USB_PEER_UPDATE_DELAY_S))
             if device.lookup_connection(handle) is not connection:
                 return
-            retain_initial = getattr(connection, _MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR, False) is True
             initial_units = int(_MANAGED_USB_CONNECTION_INTERVAL_MS / 1.25)
             await connection.cancel_on_disconnection(
                 manager.host.send_async_command(
                     hci.HCI_LE_Connection_Update_Command(
                         connection_handle=handle,
-                        connection_interval_min=initial_units if retain_initial else request.interval_min,
-                        connection_interval_max=initial_units if retain_initial else request.interval_max,
+                        connection_interval_min=initial_units,
+                        connection_interval_max=initial_units,
                         max_latency=request.latency,
                         supervision_timeout=request.timeout,
                         min_ce_length=0,
@@ -622,12 +619,10 @@ class ManagedUsbBleClient:
         transport_name: str,
         peer_address: str,
         disconnected_callback: Callable[[Any], None] | None = None,
-        retain_initial_interval: bool = False,
     ) -> None:
         self._transport_name = transport_name
         self._peer_address = peer_address
         self._disconnected_callback = disconnected_callback
-        self._retain_initial_interval = retain_initial_interval
         self._radio: ManagedUsbRadioSession | None = None
         self._device: Device | None = None
         self._peer: Peer | None = None
@@ -636,7 +631,6 @@ class ManagedUsbBleClient:
         self._notify_subscribers: dict[str, Callable[[bytes], Any]] = {}
         self._transport_loss_cleanup_task: asyncio.Task[None] | None = None
         self._release_lock = asyncio.Lock()
-        self._transport_release_error: Exception | None = None
         self._disconnecting = False
         self._mtu_size = _MANAGED_USB_DEFAULT_ATT_MTU
         self.is_connected = False
@@ -650,11 +644,6 @@ class ManagedUsbBleClient:
         if self._connection is not None:
             return int(getattr(self._connection, "att_mtu", self._mtu_size))
         return self._mtu_size
-
-    @property
-    def transport_released(self) -> bool:
-        task = self._transport_loss_cleanup_task
-        return self._connection is None and self._transport_release_error is None and (task is None or task.done())
 
     async def connect(self) -> bool:
         _require_bumble()
@@ -679,8 +668,6 @@ class ManagedUsbBleClient:
                 stage="peer connect",
                 transport_name=self._transport_name,
             )
-            if self._retain_initial_interval:
-                setattr(self._connection, _MANAGED_USB_RETAIN_INITIAL_INTERVAL_ATTR, True)
             self._connection.on("disconnection", self._on_disconnection)
             self._peer = Peer(self._connection)
             await self._request_larger_mtu()
@@ -833,11 +820,9 @@ class ManagedUsbBleClient:
                 except Exception as exc:
                     logger.warning("Managed USB pairing cleanup failed: %s", exc)
             except Exception as exc:
-                self._transport_release_error = exc
                 logger.error("Managed USB BLE peer release failed for %s: %s", self._transport_name, exc)
                 raise
             else:
-                self._transport_release_error = None
                 logger.info("Managed USB BLE peer released: %s", self._transport_name)
             finally:
                 self._clear_connection_state()
@@ -1209,46 +1194,6 @@ async def _await_usb_idle(transport_name: str, timeout_s: float = 15.0) -> None:
             f"Managed USB is still busy on {transport_name} after {timeout_s:.1f}s; "
             "refusing to reopen before close completes"
         ) from exc
-
-
-async def _finish_managed_usb_scan(
-    *,
-    device: Any | None,
-    scanning: bool,
-    transport: Any,
-    transport_name: str,
-) -> None:
-    """Stop traffic and power the controller down before releasing USB.
-
-    Each scan open/close cycle re-runs Bumble ``power_on`` (HCI reset / driver probe).
-    Closing the USB transport without ``power_off`` leaves the dongle mid-stack and
-    the next open often hangs while trying to set the controller up again.
-
-    All teardown stages use soft timeouts so a hung power_off/stop never cancels
-    the USB release mid-flight.
-    """
-    if device is not None:
-        if scanning:
-            await _soft_await(
-                device.stop_scanning(legacy=True),
-                timeout_s=MANAGED_USB_SCAN_COMMAND_TIMEOUT_S,
-                stage="legacy scan stop",
-                transport_name=transport_name,
-                retain_on_timeout=False,
-            )
-
-        if getattr(device, "powered_on", False):
-            await _soft_await(
-                device.power_off(),
-                timeout_s=MANAGED_USB_POWER_OFF_TIMEOUT_S,
-                stage="controller power off",
-                transport_name=transport_name,
-                retain_on_timeout=False,
-            )
-
-    closed_cleanly = await _close_managed_usb_transport(transport, transport_name=transport_name)
-    settle = MANAGED_USB_POST_CLOSE_SETTLE_S if closed_cleanly else MANAGED_USB_POST_CLOSE_STUCK_SETTLE_S
-    await asyncio.sleep(settle)
 
 
 def _service_data_from_advertisement(advertisement: Any) -> dict[str, bytes]:

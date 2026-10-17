@@ -205,10 +205,10 @@ each device; concurrent starts do not synchronize device sample clocks. See the
 | Doc | Description |
 |-----|-------------|
 | [docs/APIv2.md](docs/APIv2.md) | v2 API reference (`synchroni_sensor_sdk`), including multi-adapter workflows |
-| [docs/API.md](docs/API.md) | Legacy API reference (`sensor` package) |
-| [examples/](examples/) | Console demos, GUI, and [v2_cli.py](examples/v2_cli.py) Typer smoke-test CLI |
+| [examples/](examples/) | Sync/async console demos and [v2_cli.py](examples/v2_cli.py) Typer smoke-test CLI |
 
 
-The legacy `sensor` package remains available for existing integrations. New projects should use `synchroni_sensor_sdk`.
-
-If the key is not supported, the result starts with `"Error"`.
+The SDK provides `synchroni_sensor_sdk`, with both sync and async APIs. The legacy
+`sensor` package is no longer included. Applications that still import `sensor`
+must use an earlier package release or migrate to the v2 API. NumPy and
+FlatBuffers are no longer runtime dependencies.

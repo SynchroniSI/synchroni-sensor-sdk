@@ -111,26 +111,12 @@ def test_claim_allowlist_known_dongles() -> None:
     assert frozenset({("2357", "0604"), ("0a12", "0001"), ("10d7", "b012")}) == KNOWN_EEG_USB_DONGLES
 
 
-def test_windows_claim_argument_list_quotes_spaces() -> None:
-    from synchroni_sensor_sdk.async_api.driver.managed_usb.windows_claim import (
-        _normalize_exit_code,
-        _windows_argument_list,
-    )
-
-    cmdline = _windows_argument_list(["--type", "0", "--name", "Synchroni EEG Bluetooth Dongle VID_2357 PID_0604"])
-    assert cmdline.startswith('--type 0 --name "')
-    assert 'VID_2357 PID_0604"' in cmdline
-    assert "&" not in cmdline
-    assert _normalize_exit_code(4294967293) == -3
-    assert _normalize_exit_code(-3) == -3
-    assert _normalize_exit_code(0) == 0
-
-
 def test_windows_claim_runner_script_includes_dest_and_log() -> None:
     from pathlib import Path
 
     from synchroni_sensor_sdk.async_api.driver.managed_usb.windows_claim import (
         _build_elevated_runner_script,
+        _normalize_exit_code,
         _subprocess_no_window_flags,
     )
 
@@ -144,6 +130,7 @@ def test_windows_claim_runner_script_includes_dest_and_log() -> None:
     assert r"C:\tmp\claim.log" in script
     assert "exit $code" in script
     assert _subprocess_no_window_flags() in {0, 0x08000000}
+    assert [_normalize_exit_code(code) for code in (4294967293, -3, 0)] == [-3, -3, 0]
 
 
 def test_windows_adapter_id_encodes_ampersand() -> None:

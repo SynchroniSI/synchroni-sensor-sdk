@@ -40,9 +40,6 @@ songs/
 *.zip
 *.csv
 
-# v2 comparison captures
-v2_comparison/captures/
-
 # Dist
 dist/
 build/
@@ -51,5 +48,4 @@ build/
 /.pytest_cache/
 /allure-results/
 .idea/
-sensor/fb/__pycache__/
 /synchroni_sensor_sdk.egg-info/

@@ -75,12 +75,13 @@ def _try_patch_connect() -> None:
     if getattr(BleakClientWinRT, "_high_throughput_patched", False):
         return
 
-    orig_connect = BleakClientWinRT.connect
+    orig_connect: Any = BleakClientWinRT.connect
 
     @wraps(orig_connect)
-    async def patched_connect(self: Any, *args: Any, **kwargs: Any) -> None:
-        await orig_connect(self, *args, **kwargs)
+    async def patched_connect(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await orig_connect(self, *args, **kwargs)
         _set_high_throughput(self)
+        return result
 
     BleakClientWinRT.connect = patched_connect  # type: ignore[method-assign]
     BleakClientWinRT._high_throughput_patched = True  # type: ignore[attr-defined]

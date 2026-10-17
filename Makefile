@@ -5,11 +5,11 @@ POETRY ?= poetry
 RUFF   := $(POETRY) run ruff
 MYPY   := $(POETRY) run mypy
 
-# Ruff lint / format paths (legacy ``sensor/`` and ``examples/`` are excluded in pyproject).
-SRC := synchroni_sensor_sdk v2_comparison tests
+# Ruff lint / format paths (examples are excluded in pyproject).
+SRC := synchroni_sensor_sdk tests
 
 # Mypy targets (tests are intentionally omitted; mocks fail strict mode).
-TYPECHECK_SRC := synchroni_sensor_sdk v2_comparison
+TYPECHECK_SRC := synchroni_sensor_sdk
 
 .PHONY: help lint format format-check typecheck check fix
 

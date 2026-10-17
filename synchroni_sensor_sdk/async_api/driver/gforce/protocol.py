@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Protocol, Self, cast, runtime_checkable
 
-import numpy as np
-import numpy.typing as npt
 from bleak import (
     BleakClient,
     BleakGATTCharacteristic,
@@ -289,18 +287,11 @@ class SamplingRate(IntEnum):
 
 # PyPI sensor-sdk 0.9.6 decodes the EEG/ECG capability mask in this order.
 EEG_CAP_FS_BITMASK_RATES = (250, 500, 1000, 2000)
-# EMG capability bits follow the legacy gForce rate order instead.
-EMG_CAP_FS_BITMASK_RATES = (250, 500, 650, 1000)
 
 
 def decode_cap_fs_bitmask(mask: int) -> tuple[int, ...]:
     """Decode the EEG/ECG rate mask used by the released Python SDK."""
     return tuple(rate for bit, rate in enumerate(EEG_CAP_FS_BITMASK_RATES) if mask & (1 << bit))
-
-
-def decode_emg_cap_fs_bitmask(mask: int) -> tuple[int, ...]:
-    """Decode the distinct legacy gForce EMG rate mask."""
-    return tuple(rate for bit, rate in enumerate(EMG_CAP_FS_BITMASK_RATES) if mask & (1 << bit))
 
 
 @dataclass
@@ -333,21 +324,6 @@ class EmgRawDataConfig:
             SampleResolution(resolution),
             data[6] if len(data) == 7 else None,
         )
-
-
-@dataclass
-class EmgRawDataCap:
-    fs: int = 0
-    channel_mask: int = 0
-    batch_len: int = 0
-    resolution: int = 0
-
-    def to_bytes(self) -> bytes:
-        return struct.pack("<HHBB", self.fs, self.channel_mask, self.batch_len, self.resolution)
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Self:
-        return cls(*struct.unpack("<HHBB", data))
 
 
 @dataclass
@@ -584,15 +560,11 @@ class GForceProtocol:
             Command,
             asyncio.Queue[CommandReply] | None,
         ] = {}
-        self.resolution: SampleResolution = SampleResolution.BITS_8
-        self._num_channels: int = 8
         self._device: BLEDevice = device
         self._is_universal_stream: bool = is_universal_stream
         self._raw_data_buf: asyncio.Queue[RawDataPacket] | None = None
         self._raw_ingress: BoundedThreadIngress[RawDataPacket] | None = None
         self._on_ingress_fault = on_ingress_fault or self._log_ingress_fault
-        self.packet_id: int = 0
-        self.data_packet: list = []
         self._partial_cmd_expected_id: int | None = None
         self._partial_cmd_response = bytearray()
         self._managed_usb_transport = managed_usb_transport
@@ -712,7 +684,6 @@ class GForceProtocol:
                 transport_name=self._managed_usb_transport,
                 peer_address=self._managed_usb_peer_address,
                 disconnected_callback=disconnect_cb,
-                retain_initial_interval=True,
             )
             self.client = client
             try:
@@ -744,90 +715,8 @@ class GForceProtocol:
             raise
 
     def _on_data_response(self, q: asyncio.Queue[RawDataPacket], bs: bytearray) -> None:
-        # bs = bytes(bs)
-
-        # full_packet = []
-
-        # is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
-        # if is_partial_data:
-        #     packet_id = bs[1]
-        #     if self.packet_id != 0 and self.packet_id != packet_id + 1:
-        #         raise Exception(
-        #             "Unexpected packet id: expected {} got {}".format(
-        #                 self.packet_id + 1,
-        #                 packet_id,
-        #             )
-        #         )
-        #     elif self.packet_id == 0 or self.packet_id > packet_id:
-        #         self.packet_id = packet_id
-        #         self.data_packet += bs[2:]
-
-        #         if self.packet_id == 0:
-        #             full_packet = self.data_packet
-        #             self.data_packet = []
-        # else:
-        #     full_packet = bs
-
-        full_packet = bs
-        if len(full_packet) == 0:
-            return
-
-        self._queue_raw_bytes(q, full_packet)
-
-    @staticmethod
-    def _convert_acceleration_to_g(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        normalizing_factor = 65536.0
-
-        acceleration_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        num_channels = 3
-
-        return acceleration_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_gyro_to_dps(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        normalizing_factor = 65536.0
-
-        gyro_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        num_channels = 3
-
-        return gyro_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_magnetometer_to_ut(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        normalizing_factor = 65536.0
-
-        magnetometer_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        num_channels = 3
-
-        return magnetometer_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_euler(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        euler_data = np.frombuffer(data, dtype=np.float32).astype(np.float32)
-        num_channels = 3
-
-        return euler_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_quaternion(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        quaternion_data = np.frombuffer(data, dtype=np.float32).astype(np.float32)
-        num_channels = 4
-
-        return quaternion_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_rotation_matrix(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        rotation_matrix_data = np.frombuffer(data, dtype=np.int32).astype(np.float32)
-        num_channels = 9
-
-        return rotation_matrix_data.reshape(-1, num_channels)
-
-    @staticmethod
-    def _convert_emg_gesture(data: bytes) -> npt.NDArray[np.floating[Any]]:
-        emg_gesture_data = np.frombuffer(data, dtype=np.int16).astype(np.float16)
-        num_channels = 6
-
-        return emg_gesture_data.reshape(-1, num_channels)
+        if bs:
+            self._queue_raw_bytes(q, bs)
 
     def _on_universal_response(self, _: BleakGATTCharacteristic, bs: bytearray) -> None:
         buf = self._require_raw_data_buf()
@@ -1178,20 +1067,6 @@ class GForceProtocol:
             )
         )
 
-        # print('set_emg_raw_data_config returned:', ret)
-
-        self.resolution = cfg.resolution
-
-        num_channels = 0
-        ch_mask = cfg.channel_mask
-
-        while ch_mask != 0:
-            if ch_mask & 0x01 != 0:
-                num_channels += 1
-            ch_mask >>= 1
-
-        self._num_channels = num_channels
-
     async def get_emg_raw_data_config(self) -> EmgRawDataConfig:
         buf = _response_bytes(
             await self._send_request(
@@ -1202,17 +1077,6 @@ class GForceProtocol:
             )
         )
         return EmgRawDataConfig.from_bytes(buf)
-
-    async def get_emg_raw_data_cap(self) -> EmgRawDataCap:
-        buf = _response_bytes(
-            await self._send_request(
-                Request(
-                    cmd=Command.GET_EMG_RAWDATA_CAP,
-                    has_res=True,
-                )
-            )
-        )
-        return EmgRawDataCap.from_bytes(buf)
 
     async def get_eeg_raw_data_config(self) -> EegRawDataConfig:
         buf = _response_bytes(

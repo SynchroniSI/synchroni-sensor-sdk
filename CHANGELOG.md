@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.0 (2026-10-19)
+
+### Release version
+
+* Use version 2.3.0 for the connection and streaming improvements already included in 3.0.0. SDK runtime code is unchanged.
+* The legacy `sensor` module remains removed; use 2.2.1 if you need that API.
+
 ## [3.0.0](https://github.com/SynchroniSI/synchroni-sensor-sdk/compare/v2.2.1...v3.0.0) (2026-10-17)
 
 
